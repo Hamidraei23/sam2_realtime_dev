@@ -1,4 +1,4 @@
-# SAM 2: Segment Anything in Images and Videos
+# SAM 2: REALTIME and ros2 topic publisher
 
 ## Installation (Docker)
 
