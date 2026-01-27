@@ -3,6 +3,7 @@
 ## Installation (Docker)
 
 This project can be built and run using Docker.
+Which includes SAM realtime + selection of oject of interest + ros2 
 
 ### Prerequisites
 - Docker installed and running
@@ -16,8 +17,35 @@ cd ~/workspaces/sam_ws
 git clone git@github.com:Hamidraei23/sam2_realtime_dev.git
 cd sam2_realtime_dev
 docker build -t sam2-backend:latest .
+```
+### 2) Build the image
+```bash
+docker build -t sam2-backend:latest .
+```
+
+#### After build Done download SAM weights
+```bash
+cd checkpoints/
+
+./download_ckpts.sh
+
+```
 
 
+### 3) To run the Image
+```bash
+docker run -it --rm   --name sam2_backend_dev   --gpus all   --network host   --ipc host   $(for d in /dev/video* /dev/media*; do [ -e "$d" ] && printf -- "--device=%s " "$d"; done)   --device=/dev/dri   --group-add video   --group-add render   --user "$(id -u):$(id -g)"   -e DISPLAY=$DISPLAY   -e QT_X11_NO_MITSHM=1   -e XAUTHORITY=/tmp/.Xauthority   -v $XAUTHORITY:/tmp/.Xauthority:ro   -v /tmp/.X11-unix:/tmp/.X11-unix:rw   -v ~/workspaces/sam_ws/sam2_realtime_dev:/workspace   -w /workspace   sam2-backend:latest   bash
+
+```
+
+### 4) Multiple files to be run
+#### Demo of selection and detection:
+```bash
+python demo_point.py
+```
+
+## How it performs with ros2 
+![Demo](./gif/demo_one.gif)
 
 
 
