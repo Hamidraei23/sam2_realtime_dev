@@ -43,6 +43,7 @@ docker run -it --rm   --name sam2_backend_dev   --gpus all   --network host   --
 ```bash
 python demo_point.py
 ```
+<p><strong><span style="color:#d00000;">⚠️ USE THIS DOCKER WITH CAUTION: this Docker uses ROS and Conda and can have unexpected consequences.</span></strong></p>
 
 ## How it performs with ros2 
 ![Demo](./gif/demo_one.gif)
