@@ -3,6 +3,32 @@ import cv2
 import numpy as np
 import torch
 import time
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import PointStamped
+from rclpy.qos import QoSProfile
+
+# ADD THIS CLASS (somewhere above the main loop)
+class CenterPublisher(Node):
+    def __init__(self):
+        super().__init__("sam2_centers_publisher")
+        self._pubs = {}
+        self._qos = QoSProfile(depth=10)
+
+    def _get_pub(self, topic_name: str):
+        if topic_name not in self._pubs:
+            self._pubs[topic_name] = self.create_publisher(PointStamped, topic_name, self._qos)
+            self.get_logger().info(f"Created publisher: {topic_name} [PointStamped]")
+        return self._pubs[topic_name]
+
+    def publish_center(self, topic_name: str, cx: float, cy: float, frame_id: str = "image"):
+        msg = PointStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = frame_id
+        msg.point.x = float(cx)
+        msg.point.y = float(cy)
+        msg.point.z = 0.0
+        self._get_pub(topic_name).publish(msg)
 
 # -----------------------
 # Precision / CUDA setup
@@ -178,7 +204,8 @@ if not HEADLESS:
 
 t0 = time.time()
 n = 0
-
+rclpy.init(args=None)
+ros_node = CenterPublisher()
 while True:
     ret, frame_bgr = cap.read()
     if not ret:
@@ -214,9 +241,9 @@ while True:
         else list(out_obj_ids)
     )
 
-    if len(out_obj_ids_list) != 2 or set(out_obj_ids_list) != {1, 2}:
-        print(f"Stopping: expected obj_ids {{1,2}}, got {out_obj_ids_list}")
-        break
+    # if len(out_obj_ids_list) != 2 or set(out_obj_ids_list) != {1, 2}:
+    #     print(f"Stopping: expected obj_ids {{1,2}}, got {out_obj_ids_list}")
+    #     break
 
     # Compute centroids (center of segment) for each object
     centers = {}
@@ -233,11 +260,21 @@ while True:
         centers[oid] = (float(cx.item()), float(cy.item()))  # (x,y)
 
     # Print with your requested names:
-    hand_center = centers.get(1)
-    obj1_center = centers.get(2)
+    for oid in out_obj_ids_list:
+        c = centers.get(oid)
+        if c is None:
+            continue  # skip if segmentation vanished
+        cx, cy = c
+        if oid == 1:
+            topic = "/hand_center"
+        else:
+            topic = f"/obj_{oid-1}_center"
+        ros_node.publish_center(topic, cx, cy, frame_id="image")
 
-    print(f"hand center: {hand_center}")         # obj_id=1 (first selected)
-    print(f"object_one center: {obj1_center}") 
+    # Optional: allow ROS to process internal work
+    rclpy.spin_once(ros_node, timeout_sec=0.0)
+
+
 
 
     ########### ADDED CODE ############
@@ -280,3 +317,6 @@ while True:
 cap.release()
 if not HEADLESS:
     cv2.destroyAllWindows()
+
+ros_node.destroy_node()
+rclpy.shutdown()
