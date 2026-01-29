@@ -54,7 +54,7 @@ docker run -it --rm \
   -e XAUTHORITY=/tmp/.Xauthority \
   -v "$XAUTHORITY":/tmp/.Xauthority:ro \
   -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-  -v /home/hami/workspaces/sam_ws/sam2_realtime_dev:/workspace \
+  -v ~/workspaces/sam_ws/sam2_realtime_dev:/workspace \
   -w /workspace \
   -e ROS_LOG_DIR=/workspace/.ros/log \
   sam2-backend:latest \
