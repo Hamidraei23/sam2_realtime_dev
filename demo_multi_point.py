@@ -48,12 +48,12 @@ predictor = build_sam2_camera_predictor(model_cfg, sam2_checkpoint)
 # -----------------------
 # Camera
 # -----------------------
-cap = cv2.VideoCapture(0, cv2.CAP_V4L2)  # force V4L2 backend (Linux)
+cap = cv2.VideoCapture(2, cv2.CAP_V4L2)  # force V4L2 backend (Linux)
 
 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-cap.set(cv2.CAP_PROP_FPS, 120.101)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+cap.set(cv2.CAP_PROP_FPS, 30)
 print(
     "W,H,FPS,FOURCC:",
     cap.get(cv2.CAP_PROP_FRAME_WIDTH),

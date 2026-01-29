@@ -34,8 +34,31 @@ cd checkpoints/
 
 ### 3) To run the Image
 ```bash
-docker run -it --rm   --name sam2_backend_dev   --gpus all   --network host   --ipc host   $(for d in /dev/video* /dev/media*; do [ -e "$d" ] && printf -- "--device=%s " "$d"; done)   --device=/dev/dri   --group-add video   --group-add render   --user "$(id -u):$(id -g)"   -e DISPLAY=$DISPLAY   -e QT_X11_NO_MITSHM=1   -e XAUTHORITY=/tmp/.Xauthority   -v $XAUTHORITY:/tmp/.Xauthority:ro   -v /tmp/.X11-unix:/tmp/.X11-unix:rw   -v ~/workspaces/sam_ws/sam2_realtime_dev:/workspace   -w /workspace   sam2-backend:latest   bash
+devices=()
+for d in /dev/video* /dev/media*; do
+  [[ -e "$d" ]] && devices+=( "--device=$d" )
+done
 
+docker run -it --rm \
+  --name sam2_backend_dev \
+  --gpus all \
+  --network host \
+  --ipc host \
+  "${devices[@]}" \
+  --device=/dev/dri \
+  --group-add video \
+  --group-add render \
+  --user "$(id -u):$(id -g)" \
+  -e DISPLAY="$DISPLAY" \
+  -e QT_X11_NO_MITSHM=1 \
+  -e XAUTHORITY=/tmp/.Xauthority \
+  -v "$XAUTHORITY":/tmp/.Xauthority:ro \
+  -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+  -v /home/hami/workspaces/sam_ws/sam2_realtime_dev:/workspace \
+  -w /workspace \
+  -e ROS_LOG_DIR=/workspace/.ros/log \
+  sam2-backend:latest \
+  bash
 ```
 
 ### 4) Multiple files to be run
