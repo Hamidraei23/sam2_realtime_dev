@@ -41,8 +41,8 @@ if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
 
 from sam2.build_sam import build_sam2_camera_predictor
 
-sam2_checkpoint = "./checkpoints/sam2.1_hiera_tiny.pt"
-model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
+sam2_checkpoint = "./checkpoints/sam2.1_hiera_small.pt"
+model_cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
 predictor = build_sam2_camera_predictor(model_cfg, sam2_checkpoint)
 
 # -----------------------
@@ -206,6 +206,20 @@ t0 = time.time()
 n = 0
 rclpy.init(args=None)
 ros_node = CenterPublisher()
+
+
+# ------------------------------------------------------------
+# BEFORE the loop (put these somewhere above `while True:`)
+# ------------------------------------------------------------
+ref_areas = {}            # oid -> pixel area from first tracking frame (excluding hand)
+ref_areas_set = False
+last_good_centers = {}    # oid -> (cx, cy) last published "good" center
+
+AREA_MIN_RATIO = 0.5      # if area < ref_area * ratio -> publish last_good center (non-hand)
+
+# ------------------------------------------------------------
+# WHILE LOOP (rewritten)
+# ------------------------------------------------------------
 while True:
     ret, frame_bgr = cap.read()
     if not ret:
@@ -214,7 +228,9 @@ while True:
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     out_obj_ids, out_mask_logits = predictor.track(frame_rgb)
 
-    # Overlay masks (multi-object HSV coloring)
+    # -----------------------
+    # Overlay masks (multi-object HSV coloring)  (UNCHANGED behavior)
+    # -----------------------
     H, W = frame_rgb.shape[:2]
     all_mask = np.zeros((H, W, 3), dtype=np.uint8)
     all_mask[..., 1] = 255
@@ -233,56 +249,89 @@ while True:
         all_mask[out_mask[..., 0] == 255, 0] = hue
         all_mask[out_mask[..., 0] == 255, 2] = 255
 
-
-    ########### ADDED CODE ############
+    # -----------------------
+    # Centers + area tracking + "sticky center publish" (NEW)
+    # -----------------------
     out_obj_ids_list = (
         out_obj_ids.tolist()
         if hasattr(out_obj_ids, "tolist")
         else list(out_obj_ids)
     )
 
-    # if len(out_obj_ids_list) != 2 or set(out_obj_ids_list) != {1, 2}:
-    #     print(f"Stopping: expected obj_ids {{1,2}}, got {out_obj_ids_list}")
-    #     break
-
-    # Compute centroids (center of segment) for each object
+    current_area = {}
     centers = {}
-    for i, oid in enumerate(out_obj_ids_list):
-        # out_mask_logits[i] is typically [1,H,W] (based on your permute usage)
-        m = (out_mask_logits[i] > 0.0).squeeze()  # -> [H,W]
 
-        ys_xs = torch.nonzero(m, as_tuple=False)  # [N,2] with (y,x)
-        if ys_xs.numel() == 0:
+    for i, oid in enumerate(out_obj_ids_list):
+        m = (out_mask_logits[i] > 0.0).squeeze()  # [H,W] bool
+
+        area = int(m.sum().item())  # pixel area
+        current_area[oid] = area
+
+        if area == 0:
             centers[oid] = None
             continue
 
-        cy, cx = ys_xs.float().mean(dim=0)  # (y,x)
+        ys_xs = torch.nonzero(m, as_tuple=False)  # [N,2] (y,x)
+        cy, cx = ys_xs.float().mean(dim=0)
         centers[oid] = (float(cx.item()), float(cy.item()))  # (x,y)
 
-    # Print with your requested names:
+    # Capture reference areas ONCE (first tracking frame only), excluding hand (oid==1)
+    if not ref_areas_set:
+        for oid in out_obj_ids_list:
+            if oid == 1:
+                continue  # skip hand
+            a = current_area.get(oid, 0)
+            if a > 0:
+                ref_areas[oid] = a
+        ref_areas_set = True
+        ros_node.get_logger().info(
+            f"Reference areas (first frame only, excluding hand): {ref_areas}"
+        )
+
+    # Publish: if non-hand area falls below threshold -> publish last_good center (but keep mask as-is)
     for oid in out_obj_ids_list:
-        c = centers.get(oid)
-        if c is None:
-            continue  # skip if segmentation vanished
-        cx, cy = c
         if oid == 1:
             topic = "/hand_center"
         else:
             topic = f"/obj_{oid-1}_center"
-        ros_node.publish_center(topic, cx, cy, frame_id="image")
+
+        c_now = centers.get(oid)         # (cx,cy) or None
+        a_now = current_area.get(oid, 0)
+
+        if oid == 1:
+            # Hand: publish current center if available
+            if c_now is None:
+                continue
+            cx, cy = c_now
+            last_good_centers[oid] = (cx, cy)
+            ros_node.publish_center(topic, cx, cy, frame_id="image")
+            continue
+
+        # Non-hand: "too small" => publish last good
+        a0 = ref_areas.get(oid, None)
+        too_small = (a0 is not None) and (a_now < a0 * AREA_MIN_RATIO)
+
+        if (c_now is not None) and (not too_small):
+            # Good update
+            cx, cy = c_now
+            last_good_centers[oid] = (cx, cy)
+            ros_node.publish_center(topic, cx, cy, frame_id="image")
+        else:
+            # Fallback to last known good center (if exists)
+            if oid in last_good_centers:
+                cx, cy = last_good_centers[oid]
+                ros_node.publish_center(topic, cx, cy, frame_id="image")
+            # else: nothing to publish yet
 
     # Optional: allow ROS to process internal work
     rclpy.spin_once(ros_node, timeout_sec=0.0)
 
-
-
-
-    ########### ADDED CODE ############
-
+    # -----------------------
+    # Visualization + UI (UNCHANGED behavior)
+    # -----------------------
     all_mask = cv2.cvtColor(all_mask, cv2.COLOR_HSV2RGB)
     vis_rgb = cv2.addWeighted(frame_rgb, 1.0, all_mask, 0.5, 0)
 
-    # draw the original selected points as ids (reference only)
     for idx, (px, py) in enumerate(click_points, start=1):
         cv2.circle(vis_rgb, (px, py), 5, (0, 255, 0), -1)
         cv2.putText(
@@ -297,7 +346,6 @@ while True:
 
     vis_bgr = cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR)
 
-    # FPS estimate (optional)
     n += 1
     if n % 60 == 0:
         dt = time.time() - t0
@@ -307,12 +355,12 @@ while True:
         n = 0
 
     if HEADLESS:
-        # Headless mode: do nothing (or add a VideoWriter if you want)
         pass
     else:
         cv2.imshow(win_track, vis_bgr)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
+
 
 cap.release()
 if not HEADLESS:
