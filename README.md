@@ -71,8 +71,6 @@ python demo_point.py
 ## How it performs with ros2 
 ![Demo](./gif/demo_one.gif)
 
-![Demo_2](./gif/demo_two.gif)
-
 
 
 
