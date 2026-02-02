@@ -7,6 +7,12 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PointStamped
 from rclpy.qos import QoSProfile
+from sensor_msgs.msg import Image
+
+
+# ✅ RealSense
+import pyrealsense2 as rs
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 # ADD THIS CLASS (somewhere above the main loop)
 class CenterPublisher(Node):
@@ -18,7 +24,10 @@ class CenterPublisher(Node):
     def _get_pub(self, topic_name: str):
         if topic_name not in self._pubs:
             self._pubs[topic_name] = self.create_publisher(PointStamped, topic_name, self._qos)
-            self.get_logger().info(f"Created publisher: {topic_name} [PointStamped]")
+            q = QoSProfile(depth=1)
+            q.reliability = ReliabilityPolicy.RELIABLE
+            q.history = HistoryPolicy.KEEP_LAST
+            self._img_pub = self.create_publisher(Image, "/sam2/vis_image", q)
         return self._pubs[topic_name]
 
     def publish_center(self, topic_name: str, cx: float, cy: float, frame_id: str = "image"):
@@ -29,6 +38,30 @@ class CenterPublisher(Node):
         msg.point.y = float(cy)
         msg.point.z = 0.0
         self._get_pub(topic_name).publish(msg)
+
+
+    def publish_vis_image(self, bgr: np.ndarray, frame_id: str = "image"):
+        if bgr is None:
+            return
+
+        # Ensure contiguous memory (important for correct .tobytes())
+        if not bgr.flags["C_CONTIGUOUS"]:
+            bgr = np.ascontiguousarray(bgr)
+
+        h, w = bgr.shape[:2]
+
+        msg = Image()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = frame_id
+
+        msg.height = h
+        msg.width = w
+        msg.encoding = "bgr8"          # OpenCV BGR 8-bit
+        msg.is_bigendian = False
+        msg.step = w * 3               # 3 bytes per pixel
+        msg.data = bgr.tobytes()       # bytes
+
+        self._img_pub.publish(msg)
 
 # -----------------------
 # Precision / CUDA setup
@@ -46,24 +79,56 @@ model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
 predictor = build_sam2_camera_predictor(model_cfg, sam2_checkpoint)
 
 # -----------------------
-# Camera
+# Camera (RealSense)  ✅ REPLACED
 # -----------------------
-cap = cv2.VideoCapture(0, cv2.CAP_V4L2)  # force V4L2 backend (Linux)
+# Requested stream mode (must be supported by your camera)
+REQ_W, REQ_H, REQ_FPS = 640, 480, 30
 
-cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-cap.set(cv2.CAP_PROP_FPS, 30)
+ctx = rs.context()
+if len(ctx.query_devices()) == 0:
+    raise RuntimeError("No Intel RealSense device found. Check USB + permissions (/dev/bus/usb).")
+
+pipeline = rs.pipeline()
+config = rs.config()
+
+# Request COLOR stream as BGR8 so the rest of your code stays identical
+config.enable_stream(rs.stream.color, REQ_W, REQ_H, rs.format.bgr8, REQ_FPS)
+
+# Try requested mode, fallback if unsupported
+try:
+    profile = pipeline.start(config)
+except RuntimeError as e:
+    print("Failed to start RealSense with requested mode:", (REQ_W, REQ_H, REQ_FPS), "\n", e)
+    print("Trying fallbacks...")
+
+    fallbacks = [
+        (1280, 720, 30),
+        (640, 480, 30),
+        (640, 480, 60),
+    ]
+    started = False
+    for (w, h, fps) in fallbacks:
+        try:
+            config = rs.config()
+            config.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
+            profile = pipeline.start(config)
+            REQ_W, REQ_H, REQ_FPS = w, h, fps
+            started = True
+            break
+        except RuntimeError:
+            pass
+    if not started:
+        raise
+
+# Print actual mode
+cprof = profile.get_stream(rs.stream.color).as_video_stream_profile()
 print(
     "W,H,FPS,FOURCC:",
-    cap.get(cv2.CAP_PROP_FRAME_WIDTH),
-    cap.get(cv2.CAP_PROP_FRAME_HEIGHT),
-    cap.get(cv2.CAP_PROP_FPS),
-    int(cap.get(cv2.CAP_PROP_FOURCC)),
+    cprof.width(),
+    cprof.height(),
+    cprof.fps(),
+    "RS(BGR8)",
 )
-
-if not cap.isOpened():
-    raise RuntimeError("Could not open webcam (VideoCapture(0)). Check /dev/video0 mapping in Docker.")
 
 HEADLESS = (os.environ.get("DISPLAY", "") == "")
 
@@ -73,9 +138,12 @@ HEADLESS = (os.environ.get("DISPLAY", "") == "")
 last_frame_rgb = None
 last_frame_bgr = None
 for i in range(30):
-    ret, frame_bgr = cap.read()
-    if not ret:
-        raise RuntimeError(f"Failed to read frame {i+1}/30 from webcam.")
+    frames = pipeline.wait_for_frames()
+    color_frame = frames.get_color_frame()
+    if not color_frame:
+        raise RuntimeError(f"Failed to read frame {i+1}/30 from RealSense color stream.")
+
+    frame_bgr = np.asanyarray(color_frame.get_data())  # already BGR8
     last_frame_bgr = frame_bgr
     last_frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
@@ -150,7 +218,7 @@ else:
         key = cv2.waitKey(10) & 0xFF
 
         if key in (ord("q"), 27):  # q or ESC
-            cap.release()
+            pipeline.stop()
             cv2.destroyAllWindows()
             raise SystemExit("Quit.")
 
@@ -163,14 +231,6 @@ else:
                 print("No points selected. Click at least one target.")
                 continue
             break
-
-        # if n%30==0:
-        #     elapsed = time.time() - t
-        #     fps = n / elapsed if elapsed > 0 else 0.0
-        #     print(f" approx. {fps:.2f} FPS")
-
-        #     t = time.time()
-        #     n = 0
 
     cv2.destroyWindow(win)
 
@@ -220,11 +280,15 @@ AREA_MIN_RATIO = 0.5      # if area < ref_area * ratio -> publish last_good cent
 # ------------------------------------------------------------
 # WHILE LOOP (rewritten)
 # ------------------------------------------------------------
+frame_idx = 0
+ros_visualize = False    # set to False to disable visualization publishing
 while True:
-    ret, frame_bgr = cap.read()
-    if not ret:
+    frames = pipeline.wait_for_frames()
+    color_frame = frames.get_color_frame()
+    if not color_frame:
         break
 
+    frame_bgr = np.asanyarray(color_frame.get_data())  # BGR8
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     out_obj_ids, out_mask_logits = predictor.track(frame_rgb)
 
@@ -324,7 +388,7 @@ while True:
             # else: nothing to publish yet
 
     # Optional: allow ROS to process internal work
-    rclpy.spin_once(ros_node, timeout_sec=0.0)
+    
 
     # -----------------------
     # Visualization + UI (UNCHANGED behavior)
@@ -360,9 +424,14 @@ while True:
         cv2.imshow(win_track, vis_bgr)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
+    if ros_visualize:
+        PUBLISH_EVERY = 1  # publish 1 out of 3 frames
+        if (frame_idx % PUBLISH_EVERY) == 0:
+            ros_node.publish_vis_image(vis_bgr)
+        frame_idx += 1
+    rclpy.spin_once(ros_node, timeout_sec=0.0)
 
-
-cap.release()
+pipeline.stop()
 if not HEADLESS:
     cv2.destroyAllWindows()
 
