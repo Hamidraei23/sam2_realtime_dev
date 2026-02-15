@@ -8,6 +8,172 @@ from rclpy.node import Node
 from geometry_msgs.msg import PointStamped
 from rclpy.qos import QoSProfile
 
+import numpy as np
+
+import numpy as np
+
+import numpy as np
+import cv2
+
+import numpy as np
+
+import cv2
+
+def rect_angle_deg_from_mask(mask_u8):
+    """
+    mask_u8: 0/255 binary
+    returns angle in degrees, roughly in [0,180)
+    """
+    cnts, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+
+    c = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(c) < 50:
+        return None
+
+    (cx, cy), (w, h), a = cv2.minAreaRect(c)  # a typically in [-90,0)
+    # Convert to an edge direction
+    if w < h:
+        a = a + 90.0
+    # normalize to [0,180)
+    a = a % 180.0
+    return float(a)
+
+def ang_diff_deg(a, b):
+    """Shortest signed difference a-b in degrees, result in [-180,180)."""
+    return (a - b + 180.0) % 360.0 - 180.0
+
+def closest_periodic(curr_deg, prev_deg, period_deg):
+    """
+    Return curr_deg shifted by +/- period_deg*k so it's closest to prev_deg.
+    Works for squares (period=90) and lines/rectangles (period=180).
+    """
+    if prev_deg is None:
+        return curr_deg
+
+    k = round((prev_deg - curr_deg) / period_deg)
+    candidates = [curr_deg + period_deg*(k-1),
+                  curr_deg + period_deg*k,
+                  curr_deg + period_deg*(k+1)]
+    return min(candidates, key=lambda x: abs(ang_diff_deg(x, prev_deg)))
+
+
+class MaskOrientation:
+    """
+    Per-object orientation from mask moments, with direction continuity + confidence gating.
+    angle is returned in degrees in [-180, 180].
+    """
+    def __init__(self, min_area=50, min_conf=0.15):
+        self.min_area = min_area
+        self.min_conf = min_conf
+        self.prev_v = {}        # oid -> (vx, vy)
+        self.prev_angle = {}    # oid -> angle_deg
+
+    def update(self, oid: int, mask_u8: np.ndarray):
+        # mask_u8 can be 0/1 or 0/255
+        if mask_u8.dtype != np.uint8:
+            mask_u8 = mask_u8.astype(np.uint8)
+
+        # Make sure it's binary 0/255
+        if mask_u8.max() == 1:
+            mask_bin = (mask_u8 * 255)
+        else:
+            mask_bin = mask_u8
+
+        m = cv2.moments(mask_bin, binaryImage=True)
+        area = m["m00"]
+        if area < self.min_area:
+            return None, 0.0
+
+        # Covariance-like terms (normalized central moments)
+        mu20 = m["mu20"] / area
+        mu02 = m["mu02"] / area
+        mu11 = m["mu11"] / area
+
+        # Principal axis angle in radians (same formula you used)
+        theta = 0.5 * np.arctan2(2.0 * mu11, (mu20 - mu02))
+        v = np.array([np.cos(theta), np.sin(theta)], dtype=np.float32)
+
+        # Confidence: based on eigenvalues of covariance matrix
+        # lambda = (tr ± sqrt((mu20-mu02)^2 + 4*mu11^2))/2
+        tr = mu20 + mu02
+        disc = np.sqrt((mu20 - mu02) ** 2 + 4.0 * (mu11 ** 2))
+        lam1 = 0.5 * (tr + disc)
+        lam2 = 0.5 * (tr - disc)
+
+        # Elongation confidence in [0..1], near 0 means round / ambiguous axis
+        conf = float((lam1 - lam2) / (lam1 + lam2 + 1e-9))
+
+        # If ambiguous (nearly round), freeze last angle if we have it
+        if conf < self.min_conf and oid in self.prev_angle:
+            return self.prev_angle[oid], conf
+
+        # Direction continuity: flip v if it suddenly points opposite
+        if oid in self.prev_v:
+            pv = self.prev_v[oid]
+            if float(v[0] * pv[0] + v[1] * pv[1]) < 0.0:
+                v = -v
+                theta += np.pi
+
+        angle_deg = float(np.degrees(np.arctan2(v[1], v[0])))
+        angle_deg = (angle_deg + 180.0) % 360.0 - 180.0  # wrap to [-180,180]
+
+        self.prev_v[oid] = (float(v[0]), float(v[1]))
+        self.prev_angle[oid] = angle_deg
+        return angle_deg, conf
+
+
+def moment_directed_angle_deg(mask_u8, prev_v=None, history_angle_deg=None):
+    """
+    mask_u8: [H,W] 0/1 or 0/255
+    prev_v:  (vx,vy) from previous frame to disambiguate sign
+    returns: (angle_deg, v) where angle_deg is signed in [-90, +90]
+    """
+    ys, xs = np.nonzero(mask_u8)
+    n = len(xs)
+    if n < 10:
+        return None, None
+
+    x = xs.astype(np.float32)
+    y = ys.astype(np.float32)
+    cx, cy = x.mean(), y.mean()
+    x0, y0 = x - cx, y - cy
+
+    mu20 = (x0 * x0).mean()
+    mu02 = (y0 * y0).mean()
+    mu11 = (x0 * y0).mean()
+
+    # This already gives an axis angle in [-90, +90]
+    theta = 0.5 * np.arctan2(2.0 * mu11, (mu20 - mu02))  # radians
+    v = np.array([np.cos(theta), np.sin(theta)], dtype=np.float32)  # unit axis direction
+
+    # Make it a directed vector using previous frame (resolve v vs -v)
+    if prev_v is not None:
+        prev_v = np.asarray(prev_v, dtype=np.float32)
+        prev_v /= (np.linalg.norm(prev_v) + 1e-9)
+        if float(np.dot(v, prev_v)) < 0.0:
+            v = -v
+            theta = theta + np.pi  # same direction flip in angle space
+
+    # Signed angle relative to +x
+    angle_deg = float(np.degrees(np.arctan2(v[1], v[0])))
+    print(f"Raw angle: {angle_deg:.1f} degrees")
+    if len(history_angle_deg)>1:
+        array_h = np.array(history_angle_deg)
+        if array_h is not None and len(array_h) > 0:
+            avg = np.mean(array_h)
+            print(f"History angles: average: {avg:.1f} degrees")
+        # Fold to [-90, +90] (optional, but usually what people want)
+            if avg > 45 and angle_deg * history_angle_deg[-1] < 0:
+                angle_deg += 180.0
+            elif avg < -45 and angle_deg * history_angle_deg[-1] < 0:
+                angle_deg -= 180.0
+
+    return angle_deg, (float(v[0]), float(v[1]))
+
+
+
 # ADD THIS CLASS (somewhere above the main loop)
 class CenterPublisher(Node):
     def __init__(self):
@@ -220,6 +386,30 @@ AREA_MIN_RATIO = 0.5      # if area < ref_area * ratio -> publish last_good cent
 # ------------------------------------------------------------
 # WHILE LOOP (rewritten)
 # ------------------------------------------------------------
+history_two = []  # keeps last two angle_deg values for smoothing (optional)
+
+TARGET_OID = 2
+prev_angle_by_oid = {}     # continuous angle in degrees (can go beyond 180)
+MAX_STEP_DEG = 20.0
+orient = MaskOrientation(min_area=200, min_conf=0.12)
+
+prev_unwrapped_by_oid = {}  # oid -> continuous angle (can exceed ±180)
+
+def unwrap_deg(curr, prev):
+    """Unwrap curr (wrapped to [-180,180]) to be continuous relative to prev."""
+    if prev is None:
+        return curr
+    d = (curr - prev + 180.0) % 360.0 - 180.0
+    return prev + d
+# --------------------------------
+prev_angle_by_oid = {}   # oid -> continuous angle
+cal_by_oid = {}          # oid -> bool
+angle_f_by_oid = {}      # oid -> float
+angle_vis_by_oid = {} 
+
+angle_f = None
+cal = False
+
 while True:
     ret, frame_bgr = cap.read()
     if not ret:
@@ -227,6 +417,66 @@ while True:
 
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     out_obj_ids, out_mask_logits = predictor.track(frame_rgb)
+
+    
+
+
+    ############TESTING: print debug info about tracked objects
+    # TARGET_OID = 2
+    # orient = MaskOrientation(min_area=200, min_conf=0.12)
+    # prev_v = None  # remembers the directed axis from the previous frame
+
+    # --- inside your while-loop, right after predictor.track(...) ---
+    # meas = rect_angle_deg_from_mask(mask_u8)
+    out_ids = out_obj_ids.tolist() if hasattr(out_obj_ids, "tolist") else list(out_obj_ids)
+
+    for oid in out_ids:
+        if oid == 1:
+            continue  # skip hand
+
+        j = out_ids.index(oid)
+
+        mask_u8 = (out_mask_logits[j] > 0.0).squeeze().detach().cpu().numpy().astype(np.uint8) * 255
+
+        meas = rect_angle_deg_from_mask(mask_u8)   # mask_u8 must be 0/255
+
+        if meas is not None:
+            # For a square, symmetry period is 90 degrees
+            prev = prev_angle_by_oid.get(oid, None)
+            meas_cont = closest_periodic(meas, prev, period_deg=90.0)
+
+            # Optional: clamp how fast it can change per frame (prevents sudden jumps)
+            if prev is not None:
+                d = ang_diff_deg(meas_cont, prev)
+                d = float(np.clip(d, -MAX_STEP_DEG, MAX_STEP_DEG))
+                meas_cont = prev + d
+
+            prev_angle_by_oid[oid] = meas_cont
+
+            if not cal_by_oid.get(oid, False):
+                angle_f_by_oid[oid] = meas_cont
+                cal_by_oid[oid] = True
+
+            meas_cont -= angle_f_by_oid[oid]
+
+            angle_vis_by_oid[oid] = meas_cont
+            print(f"oid={oid}: angle={meas_cont:.1f} deg (meas={meas:.1f})")
+
+
+        # ang_wrapped, conf = orient.update(TARGET_OID, mask_u8)
+        # if ang_wrapped is not None:
+        #     ang_unwrapped = unwrap_deg(ang_wrapped, prev_unwrapped_by_oid.get(TARGET_OID))
+        #     prev_unwrapped_by_oid[TARGET_OID] = ang_unwrapped
+
+        #     print(
+        #         f"Angle oid={TARGET_OID}: {ang_unwrapped:.1f} deg "
+        #         f"(wrapped {ang_wrapped:.1f}, conf={conf:.2f})"
+        #     )
+
+
+    # print(f"Angle is {ang:.1f} degrees")
+
+    ############TESTING: print debug info about tracked objects
 
     # -----------------------
     # Overlay masks (multi-object HSV coloring)  (UNCHANGED behavior)
@@ -331,6 +581,58 @@ while True:
     # -----------------------
     all_mask = cv2.cvtColor(all_mask, cv2.COLOR_HSV2RGB)
     vis_rgb = cv2.addWeighted(frame_rgb, 1.0, all_mask, 0.5, 0)
+
+    AXIS_LEN = 80  # pixels, tune as you like
+
+    for oid in out_obj_ids_list:
+        if oid == 1:
+            continue  # skip hand
+
+        c = centers.get(oid, None)
+        if c is None:
+            continue
+
+        ang_deg = angle_vis_by_oid.get(oid, None)
+        if ang_deg is None:
+            continue
+
+        cx, cy = c
+        cx_i, cy_i = int(round(cx)), int(round(cy))
+
+        th = np.deg2rad(ang_deg)
+
+        # x-axis direction (cos, sin)
+        dx = float(np.cos(th))
+        dy = float(np.sin(th))
+
+        # y-axis direction = x rotated +90deg
+        dx2 = -dy
+        dy2 = dx
+
+        x1 = int(round(cx + AXIS_LEN * dx))
+        y1 = int(round(cy + AXIS_LEN * dy))
+        x2 = int(round(cx - AXIS_LEN * dx))
+        y2 = int(round(cy - AXIS_LEN * dy))
+
+        yx1 = int(round(cx + AXIS_LEN * dx2))
+        yy1 = int(round(cy + AXIS_LEN * dy2))
+        yx2 = int(round(cx - AXIS_LEN * dx2))
+        yy2 = int(round(cy - AXIS_LEN * dy2))
+
+        # draw axes (RGB colors because vis_rgb is RGB)
+        cv2.line(vis_rgb, (x2, y2), (x1, y1), (255, 0, 0), 3)   # X axis = red
+        cv2.line(vis_rgb, (yx2, yy2), (yx1, yy1), (0, 255, 0), 3) # Y axis = green
+        cv2.circle(vis_rgb, (cx_i, cy_i), 4, (255, 255, 255), -1)
+
+        cv2.putText(
+            vis_rgb,
+            f"{oid}:{ang_deg:.1f}",
+            (cx_i + 6, cy_i - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2
+        )
 
     for idx, (px, py) in enumerate(click_points, start=1):
         cv2.circle(vis_rgb, (px, py), 5, (0, 255, 0), -1)

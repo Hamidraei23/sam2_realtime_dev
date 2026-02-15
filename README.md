@@ -61,6 +61,11 @@ docker run -it --rm \
   bash
 ```
 
+or
+```
+docker run -it --rm   --name sam2_backend_dev   --gpus all   --network host   --ipc host   --privileged   -v /dev/bus/usb:/dev/bus/usb   "${devices[@]}"   --device=/dev/dri   --group-add video   --group-add render   --user "$(id -u):$(id -g)"   -e DISPLAY="$DISPLAY"   -e QT_X11_NO_MITSHM=1   -e XAUTHORITY=/tmp/.Xauthority   -v "$XAUTHORITY":/tmp/.Xauthority:ro   -v /tmp/.X11-unix:/tmp/.X11-unix:rw   -v ~/workspaces/sam_ws/sam2_realtime_dev:/workspace   -w /workspace   -e ROS_LOG_DIR=/workspace/.ros/log   sam2-backend:latest   bash
+```
+
 ### 4) Multiple files to be run
 #### Demo of selection and detection:
 ```bash
