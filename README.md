@@ -77,6 +77,8 @@ python demo_point.py
 
 ![Demo](./gif/demo_three.gif)
 
+![Demo](./gif/demo_four.gif)
+
 
 
 
