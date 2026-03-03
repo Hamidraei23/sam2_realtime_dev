@@ -187,13 +187,13 @@ class CenterPublisher(Node):
             self.get_logger().info(f"Created publisher: {topic_name} [PointStamped]")
         return self._pubs[topic_name]
 
-    def publish_center(self, topic_name: str, cx: float, cy: float, frame_id: str = "image"):
+    def publish_center(self, topic_name: str, cx: float, cy: float, yaw: float, frame_id: str = "image"):
         msg = PointStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = frame_id
         msg.point.x = float(cx)
         msg.point.y = float(cy)
-        msg.point.z = 0.0
+        msg.point.z = float(yaw)  # optional: encode angle in z
         self._get_pub(topic_name).publish(msg)
 
 # -----------------------
@@ -380,6 +380,7 @@ ros_node = CenterPublisher()
 ref_areas = {}            # oid -> pixel area from first tracking frame (excluding hand)
 ref_areas_set = False
 last_good_centers = {}    # oid -> (cx, cy) last published "good" center
+last_good_yaws = {}       # oid -> last published yaw (optional)
 
 AREA_MIN_RATIO = 0.5      # if area < ref_area * ratio -> publish last_good center (non-hand)
 
@@ -433,6 +434,8 @@ while True:
     for oid in out_ids:
         if oid == 1:
             continue  # skip hand
+
+        
 
         j = out_ids.index(oid)
 
@@ -548,13 +551,19 @@ while True:
         c_now = centers.get(oid)         # (cx,cy) or None
         a_now = current_area.get(oid, 0)
 
+        yaw = angle_vis_by_oid.get(oid, 0.0)  # optional: include angle in the message
+        yaw = np.deg2rad(yaw)
+
+          # update last good yaw even if center is bad, so it can be published with the last good center
+
         if oid == 1:
             # Hand: publish current center if available
             if c_now is None:
                 continue
             cx, cy = c_now
             last_good_centers[oid] = (cx, cy)
-            ros_node.publish_center(topic, cx, cy, frame_id="image")
+            last_good_yaws[oid] = 0.0  # optional: you can also track yaw for the hand if you want
+            ros_node.publish_center(topic, cx, cy, last_good_yaws[oid], frame_id="image")
             continue
 
         # Non-hand: "too small" => publish last good
@@ -565,12 +574,23 @@ while True:
             # Good update
             cx, cy = c_now
             last_good_centers[oid] = (cx, cy)
-            ros_node.publish_center(topic, cx, cy, frame_id="image")
+            # last_good_yaws[oid] = yaw
+            if yaw is not None:
+                last_good_yaws[oid] = yaw
+
+
+            # if oid != 1:
+            #     yaw = angle_vis_by_oid.get(oid, 0.0)  # optional: include angle in the message
+            #     yaw = np.deg2rad(yaw)  # convert to radians if you prefer
+            # else:
+            #     yaw = 0.0
+            ros_node.publish_center(topic, cx, cy, yaw, frame_id="image")
         else:
             # Fallback to last known good center (if exists)
             if oid in last_good_centers:
                 cx, cy = last_good_centers[oid]
-                ros_node.publish_center(topic, cx, cy, frame_id="image")
+                yaw = last_good_yaws[oid]
+                ros_node.publish_center(topic, cx, cy, yaw, frame_id="image")
             # else: nothing to publish yet
 
     # Optional: allow ROS to process internal work

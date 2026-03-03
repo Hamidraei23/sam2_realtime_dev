@@ -13,6 +13,45 @@ from sensor_msgs.msg import Image
 
 import time
 
+def rect_angle_deg_from_mask(mask_u8):
+    """
+    mask_u8: 0/255 binary
+    returns angle in degrees, roughly in [0,180)
+    """
+    cnts, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+
+    c = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(c) < 50:
+        return None
+
+    (cx, cy), (w, h), a = cv2.minAreaRect(c)  # a typically in [-90,0)
+    # Convert to an edge direction
+    if w < h:
+        a = a + 90.0
+    # normalize to [0,180)
+    a = a % 180.0
+    return float(a)
+
+def ang_diff_deg(a, b):
+    """Shortest signed difference a-b in degrees, result in [-180,180)."""
+    return (a - b + 180.0) % 360.0 - 180.0
+
+def closest_periodic(curr_deg, prev_deg, period_deg):
+    """
+    Return curr_deg shifted by +/- period_deg*k so it's closest to prev_deg.
+    Works for squares (period=90) and lines/rectangles (period=180).
+    """
+    if prev_deg is None:
+        return curr_deg
+
+    k = round((prev_deg - curr_deg) / period_deg)
+    candidates = [curr_deg + period_deg*(k-1),
+                  curr_deg + period_deg*k,
+                  curr_deg + period_deg*(k+1)]
+    return min(candidates, key=lambda x: abs(ang_diff_deg(x, prev_deg)))
+
 class CenterPublisher(Node):
     """
     - Subscribes to image_topic (expects bgr8) WITHOUT cv_bridge (NumPy2-safe)
@@ -54,13 +93,13 @@ class CenterPublisher(Node):
             self.get_logger().info(f"Created publisher: {topic_name} [PointStamped]")
         return self._pubs[topic_name]
 
-    def publish_center(self, topic_name: str, cx: float, cy: float, frame_id: str = "image"):
+    def publish_center(self, topic_name: str, cx: float, cy: float, yaw: float, frame_id: str = "image"):
         msg = PointStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = frame_id
         msg.point.x = float(cx)
         msg.point.y = float(cy)
-        msg.point.z = 0.0
+        msg.point.z = float(yaw)  # optional: encode angle in z
         self._get_pub(topic_name).publish(msg)
 
     # -----------------------
@@ -315,7 +354,15 @@ def main():
     ref_areas = {}         # oid -> pixel area from first tracking frame (excluding hand)
     ref_areas_set = False
     last_good_centers = {} # oid -> (cx, cy)
+    last_good_yaws = {} 
     AREA_MIN_RATIO = 0.5
+
+    prev_angle_by_oid = {}   # oid -> continuous angle
+    cal_by_oid = {}          # oid -> bool
+    angle_f_by_oid = {}      # oid -> float
+    angle_vis_by_oid = {} 
+    MAX_STEP_DEG = 20.0
+
 
     while rclpy.ok():
         # Pump ROS to receive images
@@ -327,6 +374,43 @@ def main():
 
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         out_obj_ids, out_mask_logits = predictor.track(frame_rgb)
+
+
+        out_ids = out_obj_ids.tolist() if hasattr(out_obj_ids, "tolist") else list(out_obj_ids)
+
+        for oid in out_ids:
+            if oid == 1:
+                continue  # skip hand
+
+            
+
+            j = out_ids.index(oid)
+
+            mask_u8 = (out_mask_logits[j] > 0.0).squeeze().detach().cpu().numpy().astype(np.uint8) * 255
+
+            meas = rect_angle_deg_from_mask(mask_u8)   # mask_u8 must be 0/255
+
+            if meas is not None:
+                # For a square, symmetry period is 90 degrees
+                prev = prev_angle_by_oid.get(oid, None)
+                meas_cont = closest_periodic(meas, prev, period_deg=90.0)
+
+                # Optional: clamp how fast it can change per frame (prevents sudden jumps)
+                if prev is not None:
+                    d = ang_diff_deg(meas_cont, prev)
+                    d = float(np.clip(d, -MAX_STEP_DEG, MAX_STEP_DEG))
+                    meas_cont = prev + d
+
+                prev_angle_by_oid[oid] = meas_cont
+
+                if not cal_by_oid.get(oid, False):
+                    angle_f_by_oid[oid] = meas_cont
+                    cal_by_oid[oid] = True
+
+                meas_cont -= angle_f_by_oid[oid]
+
+                angle_vis_by_oid[oid] = meas_cont
+                print(f"oid={oid}: angle={meas_cont:.1f} deg (meas={meas:.1f})")
 
         # Overlay masks (multi-object HSV coloring)
         H, W = frame_rgb.shape[:2]
@@ -388,12 +472,17 @@ def main():
             c_now = centers.get(oid)
             a_now = current_area.get(oid, 0)
 
+            yaw = angle_vis_by_oid.get(oid, 0.0)  # optional: include angle in the message
+            yaw = np.deg2rad(yaw)
+
             if oid == 1:
+            # Hand: publish current center if available
                 if c_now is None:
                     continue
                 cx, cy = c_now
                 last_good_centers[oid] = (cx, cy)
-                ros_node.publish_center(topic, cx, cy, frame_id="image")
+                last_good_yaws[oid] = 0.0  # optional: you can also track yaw for the hand if you want
+                ros_node.publish_center(topic, cx, cy, last_good_yaws[oid], frame_id="image")
                 continue
 
             a0 = ref_areas.get(oid, None)
@@ -406,8 +495,8 @@ def main():
             else:
                 if oid in last_good_centers:
                     cx, cy = last_good_centers[oid]
-                    ros_node.publish_center(topic, cx, cy, frame_id="image")
-
+                    yaw = last_good_yaws[oid]
+                    ros_node.publish_center(topic, cx, cy, yaw, frame_id="image")
         # Visualization
         all_mask = cv2.cvtColor(all_mask, cv2.COLOR_HSV2RGB)
         vis_rgb = cv2.addWeighted(frame_rgb, 1.0, all_mask, 0.5, 0)
