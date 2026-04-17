@@ -8,7 +8,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, qos_profile_sensor_data
 
-from geometry_msgs.msg import PointStamped
+from geometry_msgs.msg import Pose, PoseArray, PointStamped
 from sensor_msgs.msg import Image
 
 import time
@@ -55,12 +55,11 @@ def closest_periodic(curr_deg, prev_deg, period_deg):
 class CenterPublisher(Node):
     """
     - Subscribes to image_topic (expects bgr8) WITHOUT cv_bridge (NumPy2-safe)
-    - Publishes centers as PointStamped on per-object topics (same as before)
+    - Publishes all tracked object poses as PoseArray on /tracked_objects
     - Publishes visualization/seg overlay as sensor_msgs/Image (bgr8) on /image_seg
     """
     def __init__(self, image_topic: str = "/camera/camera/color/image_raw"):
         super().__init__("sam2_tracker_node")
-        self._pubs = {}
         self._qos = QoSProfile(depth=10)
 
         # Image subscription state
@@ -84,23 +83,47 @@ class CenterPublisher(Node):
         self._seg_pub = self.create_publisher(Image, "/image_seg", qos_profile_sensor_data)
         self.get_logger().info("Publishing segmentation overlay on: /image_seg [sensor_msgs/Image, bgr8]")
 
-    # -----------------------
-    # Center publishers (unchanged behavior)
-    # -----------------------
-    def _get_pub(self, topic_name: str):
-        if topic_name not in self._pubs:
-            self._pubs[topic_name] = self.create_publisher(PointStamped, topic_name, self._qos)
-            self.get_logger().info(f"Created publisher: {topic_name} [PointStamped]")
-        return self._pubs[topic_name]
+        # Single PoseArray publisher for all tracked objects (excluding hand)
+        self._pose_pub = self.create_publisher(PoseArray, "/tracked_objects", self._qos)
+        self.get_logger().info("Publishing tracked objects on: /tracked_objects [PoseArray]")
 
-    def publish_center(self, topic_name: str, cx: float, cy: float, yaw: float, frame_id: str = "image"):
+        # Separate hand publisher
+        self._hand_pub = self.create_publisher(PointStamped, "/hand_center", self._qos)
+        self.get_logger().info("Publishing hand center on: /hand_center [PointStamped]")
+
+    # -----------------------
+    # Publish all object poses in one PoseArray
+    # -----------------------
+    def publish_poses(self, poses_list: list, frame_id: str = "image"):
+        """
+        poses_list: list of (cx, cy, yaw_rad) tuples, ordered by object index.
+        """
+        msg = PoseArray()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = frame_id
+
+        for cx, cy, yaw_rad in poses_list:
+            p = Pose()
+            p.position.x = float(cx)
+            p.position.y = float(cy)
+            p.position.z = 0.0
+            # Encode yaw as quaternion (rotation about z)
+            p.orientation.x = 0.0
+            p.orientation.y = 0.0
+            p.orientation.z = float(np.sin(yaw_rad / 2.0))
+            p.orientation.w = float(np.cos(yaw_rad / 2.0))
+            msg.poses.append(p)
+
+        self._pose_pub.publish(msg)
+
+    def publish_hand(self, cx: float, cy: float, frame_id: str = "image"):
         msg = PointStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = frame_id
         msg.point.x = float(cx)
         msg.point.y = float(cy)
-        msg.point.z = float(yaw)  # optional: encode angle in z
-        self._get_pub(topic_name).publish(msg)
+        msg.point.z = 0.0
+        self._hand_pub.publish(msg)
 
     # -----------------------
     # NumPy-only Image conversions (NO cv_bridge)
@@ -462,27 +485,23 @@ def main():
             ref_areas_set = True
             ros_node.get_logger().info(f"Reference areas (first frame only, excluding hand): {ref_areas}")
 
-        # Publish centers
+        # Build poses list for non-hand objects; publish hand separately
+        poses_to_publish = []
         for oid in out_obj_ids_list:
-            if oid == 1:
-                topic = "/hand_center"
-            else:
-                topic = f"/obj_{oid-1}_center"
-
             c_now = centers.get(oid)
             a_now = current_area.get(oid, 0)
 
-            yaw = angle_vis_by_oid.get(oid, 0.0)  # optional: include angle in the message
-            yaw = np.deg2rad(yaw)
+            yaw = np.deg2rad(angle_vis_by_oid.get(oid, 0.0))
 
             if oid == 1:
-            # Hand: publish current center if available
-                if c_now is None:
-                    continue
-                cx, cy = c_now
-                last_good_centers[oid] = (cx, cy)
-                last_good_yaws[oid] = 0.0  # optional: you can also track yaw for the hand if you want
-                ros_node.publish_center(topic, cx, cy, last_good_yaws[oid], frame_id="image")
+                # Hand: publish on separate /hand_center topic
+                if c_now is not None:
+                    cx, cy = c_now
+                    last_good_centers[oid] = (cx, cy)
+                    ros_node.publish_hand(cx, cy, frame_id="image")
+                elif oid in last_good_centers:
+                    cx, cy = last_good_centers[oid]
+                    ros_node.publish_hand(cx, cy, frame_id="image")
                 continue
 
             a0 = ref_areas.get(oid, None)
@@ -491,12 +510,17 @@ def main():
             if (c_now is not None) and (not too_small):
                 cx, cy = c_now
                 last_good_centers[oid] = (cx, cy)
-                ros_node.publish_center(topic, cx, cy, frame_id="image")
+                if yaw is not None:
+                    last_good_yaws[oid] = yaw
+                poses_to_publish.append((cx, cy, yaw))
             else:
                 if oid in last_good_centers:
                     cx, cy = last_good_centers[oid]
-                    yaw = last_good_yaws[oid]
-                    ros_node.publish_center(topic, cx, cy, yaw, frame_id="image")
+                    yaw = last_good_yaws.get(oid, 0.0)
+                    poses_to_publish.append((cx, cy, yaw))
+
+        if poses_to_publish:
+            ros_node.publish_poses(poses_to_publish, frame_id="image")
         # Visualization
         all_mask = cv2.cvtColor(all_mask, cv2.COLOR_HSV2RGB)
         vis_rgb = cv2.addWeighted(frame_rgb, 1.0, all_mask, 0.5, 0)
