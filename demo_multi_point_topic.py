@@ -68,12 +68,12 @@ class CenterPublisher(Node):
         self._last_header = None
         self._image_topic = image_topic
 
-        # Subscribe to camera topic
+        # Subscribe to camera topic (use default reliable QoS to match most publishers)
         self._img_sub = self.create_subscription(
             Image,
             self._image_topic,
             self._on_image,
-            qos_profile_sensor_data,
+            10,
         )
         self.get_logger().info(
             f"Subscribed to image topic: {self._image_topic} [sensor_msgs/Image, bgr8]"
@@ -259,7 +259,7 @@ def main():
     rclpy.init(args=None)
 
     # topic name exactly as you asked:
-    ros_node = CenterPublisher(image_topic="/camera/camera/color/image_raw")
+    ros_node = CenterPublisher(image_topic="/image")
 
     # -----------------------
     # 1) Grab initial 30 frames from ROS topic, keep the last
