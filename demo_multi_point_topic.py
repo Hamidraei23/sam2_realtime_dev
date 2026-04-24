@@ -91,6 +91,16 @@ class CenterPublisher(Node):
         self._hand_pub = self.create_publisher(PointStamped, "/hand_center", self._qos)
         self.get_logger().info("Publishing hand center on: /hand_center [PointStamped]")
 
+        # Subscribe to external tracked objects from another system
+        self._ext_poses = []  # list of (cx, cy) pixel coords
+        self._ext_sub = self.create_subscription(
+            PoseArray,
+            "/tracked_objects_a",
+            self._on_tracked_objects_a,
+            self._qos,
+        )
+        self.get_logger().info("Subscribed to external objects on: /tracked_objects_a [PoseArray]")
+
     # -----------------------
     # Publish all object poses in one PoseArray
     # -----------------------
@@ -115,6 +125,9 @@ class CenterPublisher(Node):
             msg.poses.append(p)
 
         self._pose_pub.publish(msg)
+
+    def _on_tracked_objects_a(self, msg: PoseArray):
+        self._ext_poses = [(p.position.x, p.position.y) for p in msg.poses]
 
     def publish_hand(self, cx: float, cy: float, frame_id: str = "image"):
         msg = PointStamped()
@@ -367,12 +380,15 @@ def main():
     # -----------------------
     # 4) Track live (frames from /image)
     # -----------------------
-    win_track = "Tracking (press q to quit)"
+    win_track = "Tracking (press q to quit | S=record)"
     # if not HEADLESS:
     #     cv2.namedWindow(win_track, cv2.WINDOW_NORMAL)
 
     t0 = time.time()
     n = 0
+    video_writer = None
+    is_recording = False
+    record_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "segmented.mp4")
 
     ref_areas = {}         # oid -> pixel area from first tracking frame (excluding hand)
     ref_areas_set = False
@@ -514,10 +530,11 @@ def main():
                     last_good_yaws[oid] = yaw
                 poses_to_publish.append((cx, cy, yaw))
             else:
-                if oid in last_good_centers:
-                    cx, cy = last_good_centers[oid]
-                    yaw = last_good_yaws.get(oid, 0.0)
-                    poses_to_publish.append((cx, cy, yaw))
+                # Always append to keep PoseArray index aligned with oid order.
+                # Use last known pose if available, otherwise publish zeros as placeholder.
+                cx, cy = last_good_centers.get(oid, (0.0, 0.0))
+                yaw = last_good_yaws.get(oid, 0.0)
+                poses_to_publish.append((cx, cy, yaw))
 
         if poses_to_publish:
             ros_node.publish_poses(poses_to_publish, frame_id="image")
@@ -537,7 +554,14 @@ def main():
                 2,
             )
 
-        # vis_bgr = cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR)
+        # Draw external poses from /tracked_objects_a (orange circles, RGB space)
+        # for ext_cx, ext_cy in ros_node._ext_poses:
+        #     cv2.circle(vis_rgb, (int(ext_cx), int(ext_cy)), 10, (255, 140, 0), 2)
+
+        vis_bgr = cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR)
+
+        if is_recording and video_writer is not None:
+            video_writer.write(vis_rgb)
 
         n += 1
         if n % 60 == 0:
@@ -551,8 +575,24 @@ def main():
         rclpy.spin_once(ros_node, timeout_sec=0.0)
         if not HEADLESS:
             cv2.imshow(win_track, vis_rgb)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
                 break
+            elif key in (ord("s"), ord("S")):
+                if not is_recording:
+                    H_rec, W_rec = vis_bgr.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    video_writer = cv2.VideoWriter(record_path, fourcc, 5.5, (W_rec, H_rec))
+                    is_recording = True
+                    print(f"[REC] Recording started -> {record_path}")
+                else:
+                    is_recording = False
+                    video_writer.release()
+                    video_writer = None
+                    print(f"[REC] Recording stopped. Saved: {record_path}")
+    if is_recording and video_writer is not None:
+        video_writer.release()
+        print(f"[REC] Recording saved on exit: {record_path}")
 
     if not HEADLESS:
         cv2.destroyAllWindows()
