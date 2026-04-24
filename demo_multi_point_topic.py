@@ -13,45 +13,6 @@ from sensor_msgs.msg import Image
 
 import time
 
-def rect_angle_deg_from_mask(mask_u8):
-    """
-    mask_u8: 0/255 binary
-    returns angle in degrees, roughly in [0,180)
-    """
-    cnts, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return None
-
-    c = max(cnts, key=cv2.contourArea)
-    if cv2.contourArea(c) < 50:
-        return None
-
-    (cx, cy), (w, h), a = cv2.minAreaRect(c)  # a typically in [-90,0)
-    # Convert to an edge direction
-    if w < h:
-        a = a + 90.0
-    # normalize to [0,180)
-    a = a % 180.0
-    return float(a)
-
-def ang_diff_deg(a, b):
-    """Shortest signed difference a-b in degrees, result in [-180,180)."""
-    return (a - b + 180.0) % 360.0 - 180.0
-
-def closest_periodic(curr_deg, prev_deg, period_deg):
-    """
-    Return curr_deg shifted by +/- period_deg*k so it's closest to prev_deg.
-    Works for squares (period=90) and lines/rectangles (period=180).
-    """
-    if prev_deg is None:
-        return curr_deg
-
-    k = round((prev_deg - curr_deg) / period_deg)
-    candidates = [curr_deg + period_deg*(k-1),
-                  curr_deg + period_deg*k,
-                  curr_deg + period_deg*(k+1)]
-    return min(candidates, key=lambda x: abs(ang_diff_deg(x, prev_deg)))
-
 class CenterPublisher(Node):
     """
     - Subscribes to image_topic (expects bgr8) WITHOUT cv_bridge (NumPy2-safe)
@@ -84,12 +45,12 @@ class CenterPublisher(Node):
         self.get_logger().info("Publishing segmentation overlay on: /image_seg [sensor_msgs/Image, bgr8]")
 
         # Single PoseArray publisher for all tracked objects (excluding hand)
-        self._pose_pub = self.create_publisher(PoseArray, "/tracked_objects", self._qos)
-        self.get_logger().info("Publishing tracked objects on: /tracked_objects [PoseArray]")
+        self._pose_pub = self.create_publisher(PoseArray, "/tracked_objects_a", self._qos)
+        self.get_logger().info("Publishing tracked objects on: /tracked_objects_a [PoseArray]")
 
         # Separate hand publisher
-        self._hand_pub = self.create_publisher(PointStamped, "/hand_center", self._qos)
-        self.get_logger().info("Publishing hand center on: /hand_center [PointStamped]")
+        self._hand_pub = self.create_publisher(PointStamped, "/hand_center_a", self._qos)
+        self.get_logger().info("Publishing hand center on: /hand_center_a [PointStamped]")
 
         # Subscribe to external tracked objects from another system
         self._ext_poses = []  # list of (cx, cy) pixel coords
@@ -390,95 +351,53 @@ def main():
     is_recording = False
     record_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "segmented.mp4")
 
+    track_hand = False  # if False, first click is treated as a regular object, not hand
+
     ref_areas = {}         # oid -> pixel area from first tracking frame (excluding hand)
     ref_areas_set = False
     last_good_centers = {} # oid -> (cx, cy)
-    last_good_yaws = {} 
     AREA_MIN_RATIO = 0.5
-
-    prev_angle_by_oid = {}   # oid -> continuous angle
-    cal_by_oid = {}          # oid -> bool
-    angle_f_by_oid = {}      # oid -> float
-    angle_vis_by_oid = {} 
-    MAX_STEP_DEG = 20.0
 
 
     while rclpy.ok():
         # Pump ROS to receive images
-        rclpy.spin_once(ros_node, timeout_sec=0.01)
+        rclpy.spin_once(ros_node, timeout_sec=0.0)
 
         frame_bgr = ros_node.pop_latest_frame()
         if frame_bgr is None:
             continue
 
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        frame_rgb = frame_bgr  # _imgmsg_to_rgb8 already returns RGB
         out_obj_ids, out_mask_logits = predictor.track(frame_rgb)
 
 
         out_ids = out_obj_ids.tolist() if hasattr(out_obj_ids, "tolist") else list(out_obj_ids)
 
-        for oid in out_ids:
-            if oid == 1:
-                continue  # skip hand
-
-            
-
-            j = out_ids.index(oid)
-
-            mask_u8 = (out_mask_logits[j] > 0.0).squeeze().detach().cpu().numpy().astype(np.uint8) * 255
-
-            meas = rect_angle_deg_from_mask(mask_u8)   # mask_u8 must be 0/255
-
-            if meas is not None:
-                # For a square, symmetry period is 90 degrees
-                prev = prev_angle_by_oid.get(oid, None)
-                meas_cont = closest_periodic(meas, prev, period_deg=90.0)
-
-                # Optional: clamp how fast it can change per frame (prevents sudden jumps)
-                if prev is not None:
-                    d = ang_diff_deg(meas_cont, prev)
-                    d = float(np.clip(d, -MAX_STEP_DEG, MAX_STEP_DEG))
-                    meas_cont = prev + d
-
-                prev_angle_by_oid[oid] = meas_cont
-
-                if not cal_by_oid.get(oid, False):
-                    angle_f_by_oid[oid] = meas_cont
-                    cal_by_oid[oid] = True
-
-                meas_cont -= angle_f_by_oid[oid]
-
-                angle_vis_by_oid[oid] = meas_cont
-                print(f"oid={oid}: angle={meas_cont:.1f} deg (meas={meas:.1f})")
+        # Download all masks from GPU once per frame
+        masks_np = {}   # oid -> (H, W) uint8 numpy array (0 or 255)
+        masks_bool = {} # oid -> (H, W) bool CPU tensor
+        for j, oid in enumerate(out_ids):
+            m_bool = (out_mask_logits[j] > 0.0).squeeze().cpu()
+            masks_bool[oid] = m_bool
+            masks_np[oid] = m_bool.numpy().astype(np.uint8) * 255
 
         # Overlay masks (multi-object HSV coloring)
         H, W = frame_rgb.shape[:2]
         all_mask = np.zeros((H, W, 3), dtype=np.uint8)
         all_mask[..., 1] = 255
 
-        for i in range(len(out_obj_ids)):
-            out_mask = (
-                (out_mask_logits[i] > 0.0)
-                .permute(1, 2, 0)
-                .cpu()
-                .numpy()
-                .astype(np.uint8)
-                * 255
-            )
-
-            hue = int((i + 3) / (len(out_obj_ids) + 3) * 255)
-            all_mask[out_mask[..., 0] == 255, 0] = hue
-            all_mask[out_mask[..., 0] == 255, 2] = 255
+        for j, oid in enumerate(out_ids):
+            out_mask = masks_np[oid]
+            hue = int((j + 3) / (len(out_ids) + 3) * 255)
+            all_mask[out_mask == 255, 0] = hue
+            all_mask[out_mask == 255, 2] = 255
 
         # Centers + area tracking + sticky publish
-        out_obj_ids_list = out_obj_ids.tolist() if hasattr(out_obj_ids, "tolist") else list(out_obj_ids)
-
         current_area = {}
         centers = {}
 
-        for i, oid in enumerate(out_obj_ids_list):
-            m = (out_mask_logits[i] > 0.0).squeeze()  # [H,W] bool
-
+        for oid in out_ids:
+            m = masks_bool[oid]
             area = int(m.sum().item())
             current_area[oid] = area
 
@@ -490,26 +409,24 @@ def main():
             cy, cx = ys_xs.float().mean(dim=0)
             centers[oid] = (float(cx.item()), float(cy.item()))  # (x,y)
 
-        # Reference areas ONCE (first tracking frame), excluding hand (oid==1)
+        # Reference areas ONCE (first tracking frame)
         if not ref_areas_set:
-            for oid in out_obj_ids_list:
-                if oid == 1:
+            for oid in out_ids:
+                if track_hand and oid == 1:
                     continue
                 a = current_area.get(oid, 0)
                 if a > 0:
                     ref_areas[oid] = a
             ref_areas_set = True
-            ros_node.get_logger().info(f"Reference areas (first frame only, excluding hand): {ref_areas}")
+            ros_node.get_logger().info(f"Reference areas (first frame only{', excluding hand' if track_hand else ''}): {ref_areas}")
 
         # Build poses list for non-hand objects; publish hand separately
         poses_to_publish = []
-        for oid in out_obj_ids_list:
+        for oid in out_ids:
             c_now = centers.get(oid)
             a_now = current_area.get(oid, 0)
 
-            yaw = np.deg2rad(angle_vis_by_oid.get(oid, 0.0))
-
-            if oid == 1:
+            if track_hand and oid == 1:
                 # Hand: publish on separate /hand_center topic
                 if c_now is not None:
                     cx, cy = c_now
@@ -526,15 +443,10 @@ def main():
             if (c_now is not None) and (not too_small):
                 cx, cy = c_now
                 last_good_centers[oid] = (cx, cy)
-                if yaw is not None:
-                    last_good_yaws[oid] = yaw
-                poses_to_publish.append((cx, cy, yaw))
+                poses_to_publish.append((cx, cy, 0.0))
             else:
-                # Always append to keep PoseArray index aligned with oid order.
-                # Use last known pose if available, otherwise publish zeros as placeholder.
                 cx, cy = last_good_centers.get(oid, (0.0, 0.0))
-                yaw = last_good_yaws.get(oid, 0.0)
-                poses_to_publish.append((cx, cy, yaw))
+                poses_to_publish.append((cx, cy, 0.0))
 
         if poses_to_publish:
             ros_node.publish_poses(poses_to_publish, frame_id="image")
@@ -572,7 +484,6 @@ def main():
             n = 0
 
         # ros_node.publish_seg(vis_bgr)
-        rclpy.spin_once(ros_node, timeout_sec=0.0)
         if not HEADLESS:
             cv2.imshow(win_track, vis_rgb)
             key = cv2.waitKey(1) & 0xFF
