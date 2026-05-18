@@ -3,6 +3,8 @@ import cv2
 import numpy as np
 import torch
 import time
+from collections import defaultdict
+from contextlib import contextmanager
 
 import rclpy
 from rclpy.node import Node
@@ -11,7 +13,97 @@ from rclpy.qos import QoSProfile, qos_profile_sensor_data
 from geometry_msgs.msg import Pose, PoseArray, PointStamped
 from sensor_msgs.msg import Image
 
-import time
+
+PROFILE_TIMERS = os.environ.get("SAM2_PROFILE_TIMERS", "1") != "0"
+PROFILE_SYNC_CUDA = os.environ.get("SAM2_PROFILE_SYNC_CUDA", "1") != "0"
+PROFILE_PRINT_EVERY = int(os.environ.get("SAM2_PROFILE_PRINT_EVERY", "60"))
+
+def _profile_sync_cuda():
+    if PROFILE_SYNC_CUDA and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+@contextmanager
+def profile_section(profile, key):
+    if not PROFILE_TIMERS:
+        yield
+        return
+    _profile_sync_cuda()
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        _profile_sync_cuda()
+        profile[key] = profile.get(key, 0.0) + (time.perf_counter() - start) * 1000.0
+
+class RollingProfiler:
+    def __init__(self):
+        self.totals = defaultdict(float)
+        self.count = 0
+
+    def update(self, profile):
+        if not PROFILE_TIMERS:
+            return
+        self.count += 1
+        for key, value in profile.items():
+            if isinstance(value, (int, float)):
+                self.totals[key] += float(value)
+
+    def reset(self):
+        self.totals.clear()
+        self.count = 0
+
+    def format_line(self, fps):
+        if not PROFILE_TIMERS or self.count == 0:
+            return None
+
+        def avg(key):
+            return self.totals.get(key, 0.0) / self.count
+
+        keys = [
+            "loop_total_ms",
+            "ros_spin_ms",
+            "pop_frame_ms",
+            "predictor_wall_ms",
+            "track_total_ms",
+            "prepare_data_ms",
+            "get_feature_total_ms",
+            "image_to_cuda_ms",
+            "image_encoder_ms",
+            "feature_expand_ms",
+            "prepare_backbone_features_ms",
+            "track_step_total_ms",
+            "track_step_core_ms",
+            "high_res_features_ms",
+            "memory_conditioning_ms",
+            "memory_attention_ms",
+            "sam_heads_total_ms",
+            "sam_prompt_encoder_ms",
+            "sam_mask_decoder_ms",
+            "sam_mask_postprocess_ms",
+            "obj_ptr_ms",
+            "encode_memory_output_ms",
+            "memory_encoder_forward_ms",
+            "memory_encoder_post_ms",
+            "compact_output_ms",
+            "orig_res_output_ms",
+            "masks_cpu_ms",
+            "overlay_mask_ms",
+            "centers_ms",
+            "publish_ms",
+            "visualization_ms",
+            "gui_ms",
+        ]
+        parts = [
+            f"TIMERS avg{self.count}",
+            f"fps={fps:.2f}",
+            f"objs={avg('num_objects'):.1f}",
+        ]
+        parts.extend(
+            f"{key[:-3] if key.endswith('_ms') else key}={avg(key):.2f}ms"
+            for key in keys
+            if key in self.totals
+        )
+        return " | ".join(parts)
 
 class CenterPublisher(Node):
     """
@@ -213,10 +305,8 @@ from sam2.build_sam import build_sam2_camera_predictor
 sam2_checkpoint = "./checkpoints/sam2.1_hiera_small.pt"
 model_cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
 
-# Enable PyTorch compilation for SAM2's image encoder.
-# This keeps the rest of the realtime camera tracker unchanged, while compiling
-# only the image backbone used on every incoming frame. The first frame after
-# model construction will be slower because torch.compile has to build the graph.
+# Keep the image-encoder compilation enabled for this profiling run. The first
+# forward pass after startup is expected to be slower due to torch.compile.
 predictor = build_sam2_camera_predictor(
     model_cfg,
     sam2_checkpoint,
@@ -356,6 +446,7 @@ def main():
 
     t0 = time.time()
     n = 0
+    profile_acc = RollingProfiler()
     video_writer = None
     is_recording = False
     record_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "segmented.mp4")
@@ -369,147 +460,170 @@ def main():
 
 
     while rclpy.ok():
-        # Pump ROS to receive images
-        rclpy.spin_once(ros_node, timeout_sec=0.0)
+        frame_profile = {}
+        loop_start = time.perf_counter()
 
-        frame_bgr = ros_node.pop_latest_frame()
+        # Pump ROS to receive images
+        with profile_section(frame_profile, "ros_spin_ms"):
+            rclpy.spin_once(ros_node, timeout_sec=0.0)
+
+        with profile_section(frame_profile, "pop_frame_ms"):
+            frame_bgr = ros_node.pop_latest_frame()
         if frame_bgr is None:
             continue
 
         frame_rgb = frame_bgr  # _imgmsg_to_rgb8 already returns RGB
-        out_obj_ids, out_mask_logits = predictor.track(frame_rgb)
+        with profile_section(frame_profile, "predictor_wall_ms"):
+            out_obj_ids, out_mask_logits = predictor.track(frame_rgb)
 
+        # Add internal SAM2 timings collected inside SAM2CameraPredictor.track().
+        frame_profile.update(getattr(predictor, "last_track_profile", {}) or {})
 
         out_ids = out_obj_ids.tolist() if hasattr(out_obj_ids, "tolist") else list(out_obj_ids)
+        frame_profile["num_objects"] = float(len(out_ids))
 
         # Download all masks from GPU once per frame
-        masks_np = {}   # oid -> (H, W) uint8 numpy array (0 or 255)
-        masks_bool = {} # oid -> (H, W) bool CPU tensor
-        for j, oid in enumerate(out_ids):
-            m_bool = (out_mask_logits[j] > 0.0).squeeze().cpu()
-            masks_bool[oid] = m_bool
-            masks_np[oid] = m_bool.numpy().astype(np.uint8) * 255
+        with profile_section(frame_profile, "masks_cpu_ms"):
+            masks_np = {}   # oid -> (H, W) uint8 numpy array (0 or 255)
+            masks_bool = {} # oid -> (H, W) bool CPU tensor
+            for j, oid in enumerate(out_ids):
+                m_bool = (out_mask_logits[j] > 0.0).squeeze().cpu()
+                masks_bool[oid] = m_bool
+                masks_np[oid] = m_bool.numpy().astype(np.uint8) * 255
 
         # Overlay masks (multi-object HSV coloring)
-        H, W = frame_rgb.shape[:2]
-        all_mask = np.zeros((H, W, 3), dtype=np.uint8)
-        all_mask[..., 1] = 255
+        with profile_section(frame_profile, "overlay_mask_ms"):
+            H, W = frame_rgb.shape[:2]
+            all_mask = np.zeros((H, W, 3), dtype=np.uint8)
+            all_mask[..., 1] = 255
 
-        for j, oid in enumerate(out_ids):
-            out_mask = masks_np[oid]
-            hue = int((j + 3) / (len(out_ids) + 3) * 255)
-            all_mask[out_mask == 255, 0] = hue
-            all_mask[out_mask == 255, 2] = 255
+            for j, oid in enumerate(out_ids):
+                out_mask = masks_np[oid]
+                hue = int((j + 3) / (len(out_ids) + 3) * 255)
+                all_mask[out_mask == 255, 0] = hue
+                all_mask[out_mask == 255, 2] = 255
 
         # Centers + area tracking + sticky publish
-        current_area = {}
-        centers = {}
+        with profile_section(frame_profile, "centers_ms"):
+            current_area = {}
+            centers = {}
 
-        for oid in out_ids:
-            m = masks_bool[oid]
-            area = int(m.sum().item())
-            current_area[oid] = area
-
-            if area == 0:
-                centers[oid] = None
-                continue
-
-            ys_xs = torch.nonzero(m, as_tuple=False)  # [N,2] (y,x)
-            cy, cx = ys_xs.float().mean(dim=0)
-            centers[oid] = (float(cx.item()), float(cy.item()))  # (x,y)
-
-        # Reference areas ONCE (first tracking frame)
-        if not ref_areas_set:
             for oid in out_ids:
-                if track_hand and oid == 1:
+                m = masks_bool[oid]
+                area = int(m.sum().item())
+                current_area[oid] = area
+
+                if area == 0:
+                    centers[oid] = None
                     continue
-                a = current_area.get(oid, 0)
-                if a > 0:
-                    ref_areas[oid] = a
-            ref_areas_set = True
-            ros_node.get_logger().info(f"Reference areas (first frame only{', excluding hand' if track_hand else ''}): {ref_areas}")
+
+                ys_xs = torch.nonzero(m, as_tuple=False)  # [N,2] (y,x)
+                cy, cx = ys_xs.float().mean(dim=0)
+                centers[oid] = (float(cx.item()), float(cy.item()))  # (x,y)
+
+            # Reference areas ONCE (first tracking frame)
+            if not ref_areas_set:
+                for oid in out_ids:
+                    if track_hand and oid == 1:
+                        continue
+                    a = current_area.get(oid, 0)
+                    if a > 0:
+                        ref_areas[oid] = a
+                ref_areas_set = True
+                ros_node.get_logger().info(f"Reference areas (first frame only{', excluding hand' if track_hand else ''}): {ref_areas}")
 
         # Build poses list for non-hand objects; publish hand separately
-        poses_to_publish = []
-        for oid in out_ids:
-            c_now = centers.get(oid)
-            a_now = current_area.get(oid, 0)
+        with profile_section(frame_profile, "publish_ms"):
+            poses_to_publish = []
+            for oid in out_ids:
+                c_now = centers.get(oid)
+                a_now = current_area.get(oid, 0)
 
-            if track_hand and oid == 1:
-                # Hand: publish on separate /hand_center topic
-                if c_now is not None:
+                if track_hand and oid == 1:
+                    # Hand: publish on separate /hand_center topic
+                    if c_now is not None:
+                        cx, cy = c_now
+                        last_good_centers[oid] = (cx, cy)
+                        ros_node.publish_hand(cx, cy, frame_id="image")
+                    elif oid in last_good_centers:
+                        cx, cy = last_good_centers[oid]
+                        ros_node.publish_hand(cx, cy, frame_id="image")
+                    continue
+
+                a0 = ref_areas.get(oid, None)
+                too_small = (a0 is not None) and (a_now < a0 * AREA_MIN_RATIO)
+
+                if (c_now is not None) and (not too_small):
                     cx, cy = c_now
                     last_good_centers[oid] = (cx, cy)
-                    ros_node.publish_hand(cx, cy, frame_id="image")
-                elif oid in last_good_centers:
-                    cx, cy = last_good_centers[oid]
-                    ros_node.publish_hand(cx, cy, frame_id="image")
-                continue
+                    poses_to_publish.append((cx, cy, 0.0))
+                else:
+                    cx, cy = last_good_centers.get(oid, (0.0, 0.0))
+                    poses_to_publish.append((cx, cy, 0.0))
 
-            a0 = ref_areas.get(oid, None)
-            too_small = (a0 is not None) and (a_now < a0 * AREA_MIN_RATIO)
+            if poses_to_publish:
+                ros_node.publish_poses(poses_to_publish, frame_id="image")
 
-            if (c_now is not None) and (not too_small):
-                cx, cy = c_now
-                last_good_centers[oid] = (cx, cy)
-                poses_to_publish.append((cx, cy, 0.0))
-            else:
-                cx, cy = last_good_centers.get(oid, (0.0, 0.0))
-                poses_to_publish.append((cx, cy, 0.0))
-
-        if poses_to_publish:
-            ros_node.publish_poses(poses_to_publish, frame_id="image")
         # Visualization
-        all_mask = cv2.cvtColor(all_mask, cv2.COLOR_HSV2RGB)
-        vis_rgb = cv2.addWeighted(frame_rgb, 1.0, all_mask, 0.5, 0)
+        with profile_section(frame_profile, "visualization_ms"):
+            all_mask = cv2.cvtColor(all_mask, cv2.COLOR_HSV2RGB)
+            vis_rgb = cv2.addWeighted(frame_rgb, 1.0, all_mask, 0.5, 0)
 
-        for idx, (px, py) in enumerate(click_points, start=1):
-            cv2.circle(vis_rgb, (px, py), 5, (0, 255, 0), -1)
-            cv2.putText(
-                vis_rgb,
-                str(idx),
-                (px + 6, py - 6),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 255, 0),
-                2,
-            )
+            for idx, (px, py) in enumerate(click_points, start=1):
+                cv2.circle(vis_rgb, (px, py), 5, (0, 255, 0), -1)
+                cv2.putText(
+                    vis_rgb,
+                    str(idx),
+                    (px + 6, py - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                )
 
-        # Draw external poses from /tracked_objects_a (orange circles, RGB space)
-        # for ext_cx, ext_cy in ros_node._ext_poses:
-        #     cv2.circle(vis_rgb, (int(ext_cx), int(ext_cy)), 10, (255, 140, 0), 2)
+            # Draw external poses from /tracked_objects_a (orange circles, RGB space)
+            # for ext_cx, ext_cy in ros_node._ext_poses:
+            #     cv2.circle(vis_rgb, (int(ext_cx), int(ext_cy)), 10, (255, 140, 0), 2)
 
-        vis_bgr = cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR)
+            vis_bgr = cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR)
 
-        if is_recording and video_writer is not None:
-            video_writer.write(vis_rgb)
+            if is_recording and video_writer is not None:
+                video_writer.write(vis_rgb)
+
+        # ros_node.publish_seg(vis_bgr)
+        with profile_section(frame_profile, "gui_ms"):
+            if not HEADLESS:
+                cv2.imshow(win_track, vis_rgb)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                elif key in (ord("s"), ord("S")):
+                    if not is_recording:
+                        H_rec, W_rec = vis_bgr.shape[:2]
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        video_writer = cv2.VideoWriter(record_path, fourcc, 5.5, (W_rec, H_rec))
+                        is_recording = True
+                        print(f"[REC] Recording started -> {record_path}")
+                    else:
+                        is_recording = False
+                        video_writer.release()
+                        video_writer = None
+                        print(f"[REC] Recording stopped. Saved: {record_path}")
+
+        frame_profile["loop_total_ms"] = (time.perf_counter() - loop_start) * 1000.0
+        profile_acc.update(frame_profile)
 
         n += 1
-        if n % 60 == 0:
+        if n % PROFILE_PRINT_EVERY == 0:
             dt = time.time() - t0
             fps = n / dt if dt > 0 else 0.0
             print(f"Approx FPS: {fps:.2f}")
+            timer_line = profile_acc.format_line(fps)
+            if timer_line:
+                print(timer_line)
             t0 = time.time()
             n = 0
-
-        # ros_node.publish_seg(vis_bgr)
-        if not HEADLESS:
-            cv2.imshow(win_track, vis_rgb)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-            elif key in (ord("s"), ord("S")):
-                if not is_recording:
-                    H_rec, W_rec = vis_bgr.shape[:2]
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    video_writer = cv2.VideoWriter(record_path, fourcc, 5.5, (W_rec, H_rec))
-                    is_recording = True
-                    print(f"[REC] Recording started -> {record_path}")
-                else:
-                    is_recording = False
-                    video_writer.release()
-                    video_writer = None
-                    print(f"[REC] Recording stopped. Saved: {record_path}")
+            profile_acc.reset()
     if is_recording and video_writer is not None:
         video_writer.release()
         print(f"[REC] Recording saved on exit: {record_path}")

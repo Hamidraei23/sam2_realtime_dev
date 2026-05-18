@@ -4,6 +4,9 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import time
+from contextlib import contextmanager
+
 import torch
 import torch.distributed
 import torch.nn.functional as F
@@ -181,22 +184,23 @@ class SAM2Base(torch.nn.Module):
         self._build_sam_heads()
         self.max_cond_frames_in_attn = max_cond_frames_in_attn
 
+        # Lightweight profiling state. Subclasses may set self._perf_profile to a
+        # dictionary for a single frame; all profiled blocks accumulate milliseconds
+        # into that dictionary. CUDA synchronization is intentionally enabled so the
+        # reported timings reflect real GPU latency boundaries.
+        self._perf_profile = None
+        self._perf_profile_sync_cuda = True
+
         # Model compilation
         if compile_image_encoder:
             # Compile the forward function (not the full module) to allow loading checkpoints.
             print(
                 "Image encoder compilation is enabled. First forward pass will be slow."
             )
-            # Use max-autotune but disable CUDA Graphs. In the realtime camera
-            # tracker, the image encoder is called repeatedly while positional
-            # encodings are cached inside the model. With CUDA Graphs enabled,
-            # PyTorch can raise:
-            #
-            #   RuntimeError: accessing tensor output of CUDAGraphs that has been
-            #   overwritten by a subsequent run
-            #
-            # "max-autotune-no-cudagraphs" keeps the GEMM/convolution autotuning
-            # benefits while avoiding CUDA Graph lifetime issues in this fork.
+            # Use max-autotune but disable CUDA Graphs. CUDA Graphs can conflict
+            # with the cached positional encodings used by the image encoder in the
+            # realtime camera loop. This mode keeps autotuning while avoiding
+            # lifetime/reuse errors across consecutive frames.
             self.image_encoder.forward = torch.compile(
                 self.image_encoder.forward,
                 mode="max-autotune-no-cudagraphs",
@@ -207,6 +211,28 @@ class SAM2Base(torch.nn.Module):
     @property
     def device(self):
         return next(self.parameters()).device
+
+    def _profile_sync_cuda(self):
+        if (
+            getattr(self, "_perf_profile_sync_cuda", True)
+            and torch.cuda.is_available()
+        ):
+            torch.cuda.synchronize()
+
+    @contextmanager
+    def _profile_block(self, key):
+        profile = getattr(self, "_perf_profile", None)
+        if profile is None:
+            yield
+            return
+
+        self._profile_sync_cuda()
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._profile_sync_cuda()
+            profile[key] = profile.get(key, 0.0) + (time.perf_counter() - start) * 1000.0
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError(
@@ -347,70 +373,74 @@ class SAM2Base(torch.nn.Module):
             # a learned `no_mask_embed` to indicate no mask input in this case).
             sam_mask_prompt = None
 
-        sparse_embeddings, dense_embeddings = self.sam_prompt_encoder(
-            points=(sam_point_coords, sam_point_labels),
-            boxes=None,
-            masks=sam_mask_prompt,
-        )
-        (
-            low_res_multimasks,
-            ious,
-            sam_output_tokens,
-            object_score_logits,
-        ) = self.sam_mask_decoder(
-            image_embeddings=backbone_features,
-            image_pe=self.sam_prompt_encoder.get_dense_pe(),
-            sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
-            multimask_output=multimask_output,
-            repeat_image=False,  # the image is already batched
-            high_res_features=high_res_features,
-        )
-        if self.pred_obj_scores:
-            is_obj_appearing = object_score_logits > 0
-
-            # Mask used for spatial memories is always a *hard* choice between obj and no obj,
-            # consistent with the actual mask prediction
-            low_res_multimasks = torch.where(
-                is_obj_appearing[:, None, None],
+        with self._profile_block("sam_prompt_encoder_ms"):
+            sparse_embeddings, dense_embeddings = self.sam_prompt_encoder(
+                points=(sam_point_coords, sam_point_labels),
+                boxes=None,
+                masks=sam_mask_prompt,
+            )
+        with self._profile_block("sam_mask_decoder_ms"):
+            (
                 low_res_multimasks,
-                NO_OBJ_SCORE,
+                ious,
+                sam_output_tokens,
+                object_score_logits,
+            ) = self.sam_mask_decoder(
+                image_embeddings=backbone_features,
+                image_pe=self.sam_prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=multimask_output,
+                repeat_image=False,  # the image is already batched
+                high_res_features=high_res_features,
+            )
+        with self._profile_block("sam_mask_postprocess_ms"):
+            if self.pred_obj_scores:
+                is_obj_appearing = object_score_logits > 0
+
+                # Mask used for spatial memories is always a *hard* choice between obj and no obj,
+                # consistent with the actual mask prediction
+                low_res_multimasks = torch.where(
+                    is_obj_appearing[:, None, None],
+                    low_res_multimasks,
+                    NO_OBJ_SCORE,
+                )
+
+            # convert masks from possibly bfloat16 (or float16) to float32
+            # (older PyTorch versions before 2.1 don't support `interpolate` on bf16)
+            low_res_multimasks = low_res_multimasks.float()
+            high_res_multimasks = F.interpolate(
+                low_res_multimasks,
+                size=(self.image_size, self.image_size),
+                mode="bilinear",
+                align_corners=False,
             )
 
-        # convert masks from possibly bfloat16 (or float16) to float32
-        # (older PyTorch versions before 2.1 don't support `interpolate` on bf16)
-        low_res_multimasks = low_res_multimasks.float()
-        high_res_multimasks = F.interpolate(
-            low_res_multimasks,
-            size=(self.image_size, self.image_size),
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        sam_output_token = sam_output_tokens[:, 0]
-        if multimask_output:
-            # take the best mask prediction (with the highest IoU estimation)
-            best_iou_inds = torch.argmax(ious, dim=-1)
-            batch_inds = torch.arange(B, device=device)
-            low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-            high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-            if sam_output_tokens.size(1) > 1:
-                sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
-        else:
-            low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
-
-        # Extract object pointer from the SAM output token (with occlusion handling)
-        obj_ptr = self.obj_ptr_proj(sam_output_token)
-        if self.pred_obj_scores:
-            # Allow *soft* no obj ptr, unlike for masks
-            if self.soft_no_obj_ptr:
-                lambda_is_obj_appearing = object_score_logits.sigmoid()
+            sam_output_token = sam_output_tokens[:, 0]
+            if multimask_output:
+                # take the best mask prediction (with the highest IoU estimation)
+                best_iou_inds = torch.argmax(ious, dim=-1)
+                batch_inds = torch.arange(B, device=device)
+                low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
+                high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
+                if sam_output_tokens.size(1) > 1:
+                    sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
             else:
-                lambda_is_obj_appearing = is_obj_appearing.float()
+                low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
 
-            if self.fixed_no_obj_ptr:
-                obj_ptr = lambda_is_obj_appearing * obj_ptr
-            obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
+        with self._profile_block("obj_ptr_ms"):
+            # Extract object pointer from the SAM output token (with occlusion handling)
+            obj_ptr = self.obj_ptr_proj(sam_output_token)
+            if self.pred_obj_scores:
+                # Allow *soft* no obj ptr, unlike for masks
+                if self.soft_no_obj_ptr:
+                    lambda_is_obj_appearing = object_score_logits.sigmoid()
+                else:
+                    lambda_is_obj_appearing = is_obj_appearing.float()
+
+                if self.fixed_no_obj_ptr:
+                    obj_ptr = lambda_is_obj_appearing * obj_ptr
+                obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
 
         return (
             low_res_multimasks,
@@ -672,15 +702,17 @@ class SAM2Base(torch.nn.Module):
         memory = torch.cat(to_cat_memory, dim=0)
         memory_pos_embed = torch.cat(to_cat_memory_pos_embed, dim=0)
 
-        pix_feat_with_mem = self.memory_attention(
-            curr=current_vision_feats,
-            curr_pos=current_vision_pos_embeds,
-            memory=memory,
-            memory_pos=memory_pos_embed,
-            num_obj_ptr_tokens=num_obj_ptr_tokens,
-        )
-        # reshape the output (HW)BC => BCHW
-        pix_feat_with_mem = pix_feat_with_mem.permute(1, 2, 0).view(B, C, H, W)
+        with self._profile_block("memory_attention_ms"):
+            pix_feat_with_mem = self.memory_attention(
+                curr=current_vision_feats,
+                curr_pos=current_vision_pos_embeds,
+                memory=memory,
+                memory_pos=memory_pos_embed,
+                num_obj_ptr_tokens=num_obj_ptr_tokens,
+            )
+        with self._profile_block("memory_attention_reshape_ms"):
+            # reshape the output (HW)BC => BCHW
+            pix_feat_with_mem = pix_feat_with_mem.permute(1, 2, 0).view(B, C, H, W)
         return pix_feat_with_mem
 
     def _encode_new_memory(
@@ -716,20 +748,22 @@ class SAM2Base(torch.nn.Module):
             mask_for_mem = mask_for_mem * self.sigmoid_scale_for_mem_enc
         if self.sigmoid_bias_for_mem_enc != 0.0:
             mask_for_mem = mask_for_mem + self.sigmoid_bias_for_mem_enc
-        maskmem_out = self.memory_encoder(
-            pix_feat, mask_for_mem, skip_mask_sigmoid=True  # sigmoid already applied
-        )
-        maskmem_features = maskmem_out["vision_features"]
-        maskmem_pos_enc = maskmem_out["vision_pos_enc"]
-        # add a no-object embedding to the spatial memory to indicate that the frame
-        # is predicted to be occluded (i.e. no object is appearing in the frame)
-        if self.no_obj_embed_spatial is not None:
-            is_obj_appearing = (object_score_logits > 0).float()
-            maskmem_features += (
-                1 - is_obj_appearing[..., None, None]
-            ) * self.no_obj_embed_spatial[..., None, None].expand(
-                *maskmem_features.shape
+        with self._profile_block("memory_encoder_forward_ms"):
+            maskmem_out = self.memory_encoder(
+                pix_feat, mask_for_mem, skip_mask_sigmoid=True  # sigmoid already applied
             )
+        with self._profile_block("memory_encoder_post_ms"):
+            maskmem_features = maskmem_out["vision_features"]
+            maskmem_pos_enc = maskmem_out["vision_pos_enc"]
+            # add a no-object embedding to the spatial memory to indicate that the frame
+            # is predicted to be occluded (i.e. no object is appearing in the frame)
+            if self.no_obj_embed_spatial is not None:
+                is_obj_appearing = (object_score_logits > 0).float()
+                maskmem_features += (
+                    1 - is_obj_appearing[..., None, None]
+                ) * self.no_obj_embed_spatial[..., None, None].expand(
+                    *maskmem_features.shape
+                )
 
         return maskmem_features, maskmem_pos_enc
 
@@ -748,14 +782,15 @@ class SAM2Base(torch.nn.Module):
         prev_sam_mask_logits,
     ):
         current_out = {"point_inputs": point_inputs, "mask_inputs": mask_inputs}
-        # High-resolution feature maps for the SAM head, reshape (HW)BC => BCHW
-        if len(current_vision_feats) > 1:
-            high_res_features = [
-                x.permute(1, 2, 0).view(x.size(1), x.size(2), *s)
-                for x, s in zip(current_vision_feats[:-1], feat_sizes[:-1])
-            ]
-        else:
-            high_res_features = None
+        with self._profile_block("high_res_features_ms"):
+            # High-resolution feature maps for the SAM head, reshape (HW)BC => BCHW
+            if len(current_vision_feats) > 1:
+                high_res_features = [
+                    x.permute(1, 2, 0).view(x.size(1), x.size(2), *s)
+                    for x, s in zip(current_vision_feats[:-1], feat_sizes[:-1])
+                ]
+            else:
+                high_res_features = None
         if mask_inputs is not None and self.use_mask_input_as_output_without_sam:
             # When use_mask_input_as_output_without_sam=True, we directly output the mask input
             # (see it as a GT mask) without using a SAM prompt encoder + mask decoder.
@@ -766,16 +801,17 @@ class SAM2Base(torch.nn.Module):
             )
         else:
             # fused the visual feature with previous memory features in the memory bank
-            pix_feat = self._prepare_memory_conditioned_features(
-                frame_idx=frame_idx,
-                is_init_cond_frame=is_init_cond_frame,
-                current_vision_feats=current_vision_feats[-1:],
-                current_vision_pos_embeds=current_vision_pos_embeds[-1:],
-                feat_sizes=feat_sizes[-1:],
-                output_dict=output_dict,
-                num_frames=num_frames,
-                track_in_reverse=track_in_reverse,
-            )
+            with self._profile_block("memory_conditioning_ms"):
+                pix_feat = self._prepare_memory_conditioned_features(
+                    frame_idx=frame_idx,
+                    is_init_cond_frame=is_init_cond_frame,
+                    current_vision_feats=current_vision_feats[-1:],
+                    current_vision_pos_embeds=current_vision_pos_embeds[-1:],
+                    feat_sizes=feat_sizes[-1:],
+                    output_dict=output_dict,
+                    num_frames=num_frames,
+                    track_in_reverse=track_in_reverse,
+                )
             # apply SAM-style segmentation head
             # here we might feed previously predicted low-res SAM mask logits into the SAM mask decoder,
             # e.g. in demo where such logits come from earlier interaction instead of correction sampling
@@ -784,13 +820,14 @@ class SAM2Base(torch.nn.Module):
                 assert point_inputs is not None and mask_inputs is None
                 mask_inputs = prev_sam_mask_logits
             multimask_output = self._use_multimask(is_init_cond_frame, point_inputs)
-            sam_outputs = self._forward_sam_heads(
-                backbone_features=pix_feat,
-                point_inputs=point_inputs,
-                mask_inputs=mask_inputs,
-                high_res_features=high_res_features,
-                multimask_output=multimask_output,
-            )
+            with self._profile_block("sam_heads_total_ms"):
+                sam_outputs = self._forward_sam_heads(
+                    backbone_features=pix_feat,
+                    point_inputs=point_inputs,
+                    mask_inputs=mask_inputs,
+                    high_res_features=high_res_features,
+                    multimask_output=multimask_output,
+                )
 
         return current_out, sam_outputs, high_res_features, pix_feat
 
@@ -840,19 +877,20 @@ class SAM2Base(torch.nn.Module):
         # The previously predicted SAM mask logits (which can be fed together with new clicks in demo).
         prev_sam_mask_logits=None,
     ):
-        current_out, sam_outputs, _, _ = self._track_step(
-            frame_idx,
-            is_init_cond_frame,
-            current_vision_feats,
-            current_vision_pos_embeds,
-            feat_sizes,
-            point_inputs,
-            mask_inputs,
-            output_dict,
-            num_frames,
-            track_in_reverse,
-            prev_sam_mask_logits,
-        )
+        with self._profile_block("track_step_core_ms"):
+            current_out, sam_outputs, _, _ = self._track_step(
+                frame_idx,
+                is_init_cond_frame,
+                current_vision_feats,
+                current_vision_pos_embeds,
+                feat_sizes,
+                point_inputs,
+                mask_inputs,
+                output_dict,
+                num_frames,
+                track_in_reverse,
+                prev_sam_mask_logits,
+            )
 
         (
             _,
@@ -874,15 +912,16 @@ class SAM2Base(torch.nn.Module):
 
         # Finally run the memory encoder on the predicted mask to encode
         # it into a new memory feature (that can be used in future frames)
-        self._encode_memory_in_output(
-            current_vision_feats,
-            feat_sizes,
-            point_inputs,
-            run_mem_encoder,
-            high_res_masks,
-            object_score_logits,
-            current_out,
-        )
+        with self._profile_block("encode_memory_output_ms"):
+            self._encode_memory_in_output(
+                current_vision_feats,
+                feat_sizes,
+                point_inputs,
+                run_mem_encoder,
+                high_res_masks,
+                object_score_logits,
+                current_out,
+            )
 
         return current_out
 

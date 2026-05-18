@@ -38,6 +38,7 @@ class SAM2CameraPredictor(SAM2Base):
         self.clear_non_cond_mem_for_multi_obj = clear_non_cond_mem_for_multi_obj
         self.condition_state = {}
         self.frame_idx = 0
+        self.last_track_profile = {}
 
     def perpare_data(
         self,
@@ -669,73 +670,88 @@ class SAM2CameraPredictor(SAM2Base):
         self,
         img,
     ):
-        self.frame_idx += 1
-        self.condition_state["num_frames"] += 1
-        if not self.condition_state["tracking_has_started"]:
-            self.propagate_in_video_preflight()
+        profile = {}
+        self._perf_profile = profile
+        self.last_track_profile = profile
+        try:
+            with self._profile_block("track_total_ms"):
+                with self._profile_block("preflight_ms"):
+                    self.frame_idx += 1
+                    self.condition_state["num_frames"] += 1
+                    if not self.condition_state["tracking_has_started"]:
+                        self.propagate_in_video_preflight()
 
-        img, _, _ = self.perpare_data(img, image_size=self.image_size)
+                with self._profile_block("prepare_data_ms"):
+                    img, _, _ = self.perpare_data(img, image_size=self.image_size)
 
-        output_dict = self.condition_state["output_dict"]
-        obj_ids = self.condition_state["obj_ids"]
-        batch_size = self._get_obj_num()
+                output_dict = self.condition_state["output_dict"]
+                obj_ids = self.condition_state["obj_ids"]
+                batch_size = self._get_obj_num()
+                profile["num_objects"] = float(batch_size)
 
-        # Retrieve correct image features
-        (
-            _,
-            _,
-            current_vision_feats,
-            current_vision_pos_embeds,
-            feat_sizes,
-        ) = self._get_feature(img, batch_size)
+                # Retrieve correct image features
+                with self._profile_block("get_feature_total_ms"):
+                    (
+                        _,
+                        _,
+                        current_vision_feats,
+                        current_vision_pos_embeds,
+                        feat_sizes,
+                    ) = self._get_feature(img, batch_size)
 
-        current_out = self.track_step(
-            frame_idx=self.frame_idx,
-            is_init_cond_frame=False,
-            current_vision_feats=current_vision_feats,
-            current_vision_pos_embeds=current_vision_pos_embeds,
-            feat_sizes=feat_sizes,
-            point_inputs=None,
-            mask_inputs=None,
-            output_dict=output_dict,
-            num_frames=self.condition_state["num_frames"],
-            track_in_reverse=False,
-            run_mem_encoder=True,
-            prev_sam_mask_logits=None,
-        )
+                with self._profile_block("track_step_total_ms"):
+                    current_out = self.track_step(
+                        frame_idx=self.frame_idx,
+                        is_init_cond_frame=False,
+                        current_vision_feats=current_vision_feats,
+                        current_vision_pos_embeds=current_vision_pos_embeds,
+                        feat_sizes=feat_sizes,
+                        point_inputs=None,
+                        mask_inputs=None,
+                        output_dict=output_dict,
+                        num_frames=self.condition_state["num_frames"],
+                        track_in_reverse=False,
+                        run_mem_encoder=True,
+                        prev_sam_mask_logits=None,
+                    )
 
-        # optionally offload the output to CPU memory to save GPU space
-        storage_device = self.condition_state["storage_device"]
-        maskmem_features = current_out["maskmem_features"]
-        if maskmem_features is not None:
-            maskmem_features = maskmem_features.to(torch.bfloat16)
-            maskmem_features = maskmem_features.to(storage_device, non_blocking=True)
-        pred_masks_gpu = current_out["pred_masks"]
-        # potentially fill holes in the predicted masks
-        if self.fill_hole_area > 0:
-            pred_masks_gpu = fill_holes_in_mask_scores(
-                pred_masks_gpu, self.fill_hole_area
-            )
-        pred_masks = pred_masks_gpu.to(storage_device, non_blocking=True)
-        # "maskmem_pos_enc" is the same across frames, so we only need to store one copy of it
-        maskmem_pos_enc = self._get_maskmem_pos_enc(current_out)
-        # object pointer is a small tensor, so we always keep it on GPU memory for fast access
-        obj_ptr = current_out["obj_ptr"]
-        object_score_logits = current_out["object_score_logits"]
-        # make a compact version of this frame's output to reduce the state size
-        current_out = {
-            "maskmem_features": maskmem_features,
-            "maskmem_pos_enc": maskmem_pos_enc,
-            "pred_masks": pred_masks,
-            "obj_ptr": obj_ptr,
-            "object_score_logits": object_score_logits,
-        }
+                with self._profile_block("compact_output_ms"):
+                    # optionally offload the output to CPU memory to save GPU space
+                    storage_device = self.condition_state["storage_device"]
+                    maskmem_features = current_out["maskmem_features"]
+                    if maskmem_features is not None:
+                        maskmem_features = maskmem_features.to(torch.bfloat16)
+                        maskmem_features = maskmem_features.to(storage_device, non_blocking=True)
+                    pred_masks_gpu = current_out["pred_masks"]
+                    # potentially fill holes in the predicted masks
+                    if self.fill_hole_area > 0:
+                        pred_masks_gpu = fill_holes_in_mask_scores(
+                            pred_masks_gpu, self.fill_hole_area
+                        )
+                    pred_masks = pred_masks_gpu.to(storage_device, non_blocking=True)
+                    # "maskmem_pos_enc" is the same across frames, so we only need to store one copy of it
+                    maskmem_pos_enc = self._get_maskmem_pos_enc(current_out)
+                    # object pointer is a small tensor, so we always keep it on GPU memory for fast access
+                    obj_ptr = current_out["obj_ptr"]
+                    object_score_logits = current_out["object_score_logits"]
+                    # make a compact version of this frame's output to reduce the state size
+                    current_out = {
+                        "maskmem_features": maskmem_features,
+                        "maskmem_pos_enc": maskmem_pos_enc,
+                        "pred_masks": pred_masks,
+                        "obj_ptr": obj_ptr,
+                        "object_score_logits": object_score_logits,
+                    }
 
-        # output_dict[storage_key][self.frame_idx] = current_out
-        self._manage_memory_obj(self.frame_idx, current_out)
+                # output_dict[storage_key][self.frame_idx] = current_out
+                with self._profile_block("manage_memory_ms"):
+                    self._manage_memory_obj(self.frame_idx, current_out)
 
-        _, video_res_masks = self._get_orig_video_res_output(pred_masks_gpu)
-        return obj_ids, video_res_masks
+                with self._profile_block("orig_res_output_ms"):
+                    _, video_res_masks = self._get_orig_video_res_output(pred_masks_gpu)
+            return obj_ids, video_res_masks
+        finally:
+            self._perf_profile = None
 
     def _manage_memory_obj(self, frame_idx, current_out):
         output_dict = self.condition_state["output_dict"]
@@ -929,23 +945,29 @@ class SAM2CameraPredictor(SAM2Base):
         return features
 
     def _get_feature(self, img, batch_size):
-        image = img.cuda().float().unsqueeze(0)
-        backbone_out = self.forward_image(image)
-        expanded_image = image.expand(batch_size, -1, -1, -1)
-        expanded_backbone_out = {
-            "backbone_fpn": backbone_out["backbone_fpn"].copy(),
-            "vision_pos_enc": backbone_out["vision_pos_enc"].copy(),
-        }
-        for i, feat in enumerate(expanded_backbone_out["backbone_fpn"]):
-            expanded_backbone_out["backbone_fpn"][i] = feat.expand(
-                batch_size, -1, -1, -1
-            )
-        for i, pos in enumerate(expanded_backbone_out["vision_pos_enc"]):
-            pos = pos.expand(batch_size, -1, -1, -1)
-            expanded_backbone_out["vision_pos_enc"][i] = pos
+        with self._profile_block("image_to_cuda_ms"):
+            image = img.cuda().float().unsqueeze(0)
 
-        features = self._prepare_backbone_features(expanded_backbone_out)
-        features = (expanded_image,) + features
+        with self._profile_block("image_encoder_ms"):
+            backbone_out = self.forward_image(image)
+
+        with self._profile_block("feature_expand_ms"):
+            expanded_image = image.expand(batch_size, -1, -1, -1)
+            expanded_backbone_out = {
+                "backbone_fpn": backbone_out["backbone_fpn"].copy(),
+                "vision_pos_enc": backbone_out["vision_pos_enc"].copy(),
+            }
+            for i, feat in enumerate(expanded_backbone_out["backbone_fpn"]):
+                expanded_backbone_out["backbone_fpn"][i] = feat.expand(
+                    batch_size, -1, -1, -1
+                )
+            for i, pos in enumerate(expanded_backbone_out["vision_pos_enc"]):
+                pos = pos.expand(batch_size, -1, -1, -1)
+                expanded_backbone_out["vision_pos_enc"][i] = pos
+
+        with self._profile_block("prepare_backbone_features_ms"):
+            features = self._prepare_backbone_features(expanded_backbone_out)
+            features = (expanded_image,) + features
         return features
 
     def _run_single_frame_inference(
