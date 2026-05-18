@@ -302,16 +302,121 @@ if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
 
 from sam2.build_sam import build_sam2_camera_predictor
 
-sam2_checkpoint = "./checkpoints/sam2.1_hiera_small.pt"
-model_cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
+sam2_checkpoint = os.environ.get(
+    "SAM2_CHECKPOINT",
+    "./checkpoints/sam2.1_hiera_small.pt",
+)
+model_cfg = os.environ.get(
+    "SAM2_MODEL_CFG",
+    "configs/sam2.1/sam2.1_hiera_s.yaml",
+)
 
-# Keep the image-encoder compilation enabled for this profiling run. The first
-# forward pass after startup is expected to be slower due to torch.compile.
+hydra_overrides_extra = []
+
+# Keep the previous optimization enabled by default.
+# Set SAM2_COMPILE_IMAGE_ENCODER=0 to disable it for comparison tests.
+if os.environ.get("SAM2_COMPILE_IMAGE_ENCODER", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+):
+    hydra_overrides_extra.append("++model.compile_image_encoder=true")
+
+# Reduce the internal SAM2 image resolution.
+# Baseline value in sam2.1_hiera_s.yaml is 1024.
+#
+# This can safely be passed as a Hydra override before loading the checkpoint,
+# because it does not change the shape of checkpoint parameters.
+sam2_image_size = os.environ.get("SAM2_IMAGE_SIZE")
+if sam2_image_size not in (None, ""):
+    hydra_overrides_extra.append(f"model.image_size={int(sam2_image_size)}")
+
+# Change the temporal stride used to select memory frames at evaluation time.
+# Baseline value in sam2.1_hiera_s.yaml is 1.
+#
+# Unlike model.num_maskmem, this does not change checkpoint parameter shapes, so
+# it can safely be passed as a Hydra override before loading the checkpoint.
+sam2_memory_temporal_stride = os.environ.get("SAM2_MEMORY_TEMPORAL_STRIDE")
+if sam2_memory_temporal_stride not in (None, ""):
+    sam2_memory_temporal_stride = int(sam2_memory_temporal_stride)
+    if sam2_memory_temporal_stride < 1:
+        raise ValueError(
+            f"SAM2_MEMORY_TEMPORAL_STRIDE must be >= 1; "
+            f"got {sam2_memory_temporal_stride}"
+        )
+    hydra_overrides_extra.append(
+        f"++model.memory_temporal_stride_for_eval={sam2_memory_temporal_stride}"
+    )
+
+print("SAM2 checkpoint:", sam2_checkpoint)
+print("SAM2 config:", model_cfg)
+print("SAM2 Hydra overrides:", hydra_overrides_extra)
+
 predictor = build_sam2_camera_predictor(
     model_cfg,
     sam2_checkpoint,
-    hydra_overrides_extra=["++model.compile_image_encoder=true"],
+    hydra_overrides_extra=hydra_overrides_extra,
 )
+
+
+def _apply_runtime_num_maskmem(predictor, value):
+    """
+    Reduce SAM2's runtime memory window after checkpoint loading.
+
+    We cannot pass model.num_maskmem as a Hydra override before loading the
+    checkpoint, because maskmem_tpos_enc is a checkpoint parameter whose first
+    dimension equals num_maskmem. SAM2.1 checkpoints use num_maskmem=7.
+
+    For reduced values, keep the most recent temporal positional embeddings:
+      old shape [7, 1, 1, C]
+      new shape [N, 1, 1, C] = old[-N:]
+
+    This preserves the embedding used for the conditioning frame and the most
+    recent memory frames.
+    """
+    if value in (None, ""):
+        return
+
+    new_num_maskmem = int(value)
+    old_num_maskmem = int(predictor.num_maskmem)
+
+    if new_num_maskmem == old_num_maskmem:
+        print(f"SAM2 runtime num_maskmem: {old_num_maskmem} unchanged")
+        return
+
+    if new_num_maskmem < 1:
+        raise ValueError(
+            f"SAM2_NUM_MASKMEM must be >= 1 for video tracking; got {new_num_maskmem}"
+        )
+
+    if new_num_maskmem > old_num_maskmem:
+        raise ValueError(
+            f"SAM2_NUM_MASKMEM={new_num_maskmem} is larger than checkpoint/config "
+            f"num_maskmem={old_num_maskmem}. This quick runtime override only supports "
+            f"reducing num_maskmem."
+        )
+
+    old_tpos = predictor.maskmem_tpos_enc
+    new_tpos = old_tpos[-new_num_maskmem:].detach().clone()
+
+    predictor.num_maskmem = new_num_maskmem
+    predictor.maskmem_tpos_enc = torch.nn.Parameter(
+        new_tpos,
+        requires_grad=old_tpos.requires_grad,
+    )
+
+    print(
+        "SAM2 runtime num_maskmem override:",
+        f"{old_num_maskmem} -> {new_num_maskmem}",
+        "| maskmem_tpos_enc:",
+        tuple(old_tpos.shape),
+        "->",
+        tuple(predictor.maskmem_tpos_enc.shape),
+    )
+
+
+_apply_runtime_num_maskmem(predictor, os.environ.get("SAM2_NUM_MASKMEM"))
 
 HEADLESS = (os.environ.get("DISPLAY", "") == "")
 
