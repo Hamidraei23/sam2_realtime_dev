@@ -11,10 +11,14 @@ useful for experiments without editing code:
     SAM2_IMAGE_SIZE=1024 python demo_multi_point_topic.py
     SAM2_NUM_MASKMEM=7 python demo_multi_point_topic.py
     SAM2_MEMORY_TEMPORAL_STRIDE=3 python demo_multi_point_topic.py
+    SAM2_COMPILE_MEMORY_ATTENTION=0 python demo_multi_point_topic.py
+    SAM2_COMPILE_MEMORY_ATTENTION_FULLGRAPH=1 python demo_multi_point_topic.py
+    SAM2_COMPILE_MEMORY_ATTENTION_DYNAMIC=1 python demo_multi_point_topic.py
 
 Important implementation detail:
-- `image_size`, `compile_image_encoder`, and `memory_temporal_stride_for_eval`
-  are applied as Hydra overrides before model construction.
+- `image_size`, `compile_image_encoder`, `compile_memory_attention`, and
+  `memory_temporal_stride_for_eval` are applied as Hydra overrides before model
+  construction.
 - `runtime_num_maskmem` is applied after checkpoint loading, because changing
   `model.num_maskmem` before loading would change the checkpoint tensor shape of
   `maskmem_tpos_enc` and cause a load_state_dict size mismatch.
@@ -28,9 +32,22 @@ SAM2_REALTIME_PROFILE = {
     "model_cfg": "configs/sam2.1/sam2.1_hiera_s.yaml",
 
     # Keep the PyTorch-compiled image encoder enabled by default. In this fork,
-    # sam2/modeling/sam2_base.py should compile it with
+    # sam2/modeling/sam2_base.py compiles it with
     # mode="max-autotune-no-cudagraphs" to avoid CUDA Graph lifetime issues.
     "compile_image_encoder": True,
+
+    # Compile the memory-attention module, which is the dominant bottleneck in
+    # multi-object tracking. This is intentionally configurable because the first
+    # few tracking frames can be slower while TorchInductor compiles shape-specific
+    # graphs. Set SAM2_COMPILE_MEMORY_ATTENTION=0 to disable it.
+    "compile_memory_attention": True,
+
+    # Safer default for memory attention than fullgraph=True. RoPEAttention updates
+    # cached rotary encodings internally, so allowing graph breaks is more robust
+    # while still letting TorchInductor optimize the heavy tensor kernels.
+    "compile_memory_attention_fullgraph": False,
+    "compile_memory_attention_dynamic": False,
+    "compile_memory_attention_mode": "max-autotune-no-cudagraphs",
 
     # Internal SAM2 image resolution. 768 gave a strong speedup while preserving
     # more detail than more aggressive reductions such as 512.

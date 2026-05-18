@@ -96,6 +96,10 @@ class SAM2Base(torch.nn.Module):
         # extra arguments used to construct the SAM mask decoder; if not None, it should be a dict of kwargs to be passed into `MaskDecoder` class.
         sam_mask_decoder_extra_args=None,
         compile_image_encoder: bool = False,
+        compile_memory_attention: bool = False,
+        compile_memory_attention_mode: str = "max-autotune-no-cudagraphs",
+        compile_memory_attention_fullgraph: bool = False,
+        compile_memory_attention_dynamic: bool = False,
     ):
         super().__init__()
 
@@ -207,6 +211,65 @@ class SAM2Base(torch.nn.Module):
                 fullgraph=True,
                 dynamic=False,
             )
+
+        if compile_memory_attention:
+            # Compile only the memory-attention forward path. This is the dominant
+            # bottleneck in multi-object realtime tracking, but its input shapes
+            # depend on the number of tracked objects and on the currently selected
+            # memory frames. With dynamic=False, TorchInductor will specialize and
+            # may compile a new graph when these shapes change. In this demo the
+            # object count is fixed after prompt selection, so the graph stabilizes
+            # after the initial warm-up frames.
+            print(
+                "Memory attention compilation is enabled. First tracking frames "
+                "may be slow while TorchInductor compiles shape-specific graphs."
+            )
+            self.memory_attention.forward = self._compile_forward_with_fallback(
+                self.memory_attention.forward,
+                name="memory_attention",
+                mode=compile_memory_attention_mode,
+                fullgraph=compile_memory_attention_fullgraph,
+                dynamic=compile_memory_attention_dynamic,
+            )
+
+    @staticmethod
+    def _compile_forward_with_fallback(
+        eager_forward,
+        name: str,
+        mode: str = "max-autotune-no-cudagraphs",
+        fullgraph: bool = False,
+        dynamic: bool = False,
+    ):
+        """Compile a bound forward function and fall back to eager on failure.
+
+        torch.compile failures can occur lazily on the first real invocation,
+        especially for modules with internal caches or shape-dependent control
+        flow. The fallback keeps the realtime demo usable: if compilation fails,
+        the original eager implementation is used for the rest of the process.
+        """
+        compiled_forward = torch.compile(
+            eager_forward,
+            mode=mode,
+            fullgraph=fullgraph,
+            dynamic=dynamic,
+        )
+        state = {"failed": False}
+
+        def wrapped_forward(*args, **kwargs):
+            if state["failed"]:
+                return eager_forward(*args, **kwargs)
+            try:
+                return compiled_forward(*args, **kwargs)
+            except Exception as exc:
+                state["failed"] = True
+                print(
+                    f"[WARN] torch.compile for {name} failed; "
+                    f"falling back to eager mode. Error: {exc}"
+                )
+                return eager_forward(*args, **kwargs)
+
+        return wrapped_forward
+
 
     @property
     def device(self):

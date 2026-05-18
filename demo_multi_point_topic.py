@@ -327,6 +327,37 @@ def _build_hydra_overrides(profile):
     ):
         hydra_overrides_extra.append("++model.compile_image_encoder=true")
 
+    if _env_bool(
+        "SAM2_COMPILE_MEMORY_ATTENTION",
+        profile.get("compile_memory_attention", False),
+    ):
+        hydra_overrides_extra.append("++model.compile_memory_attention=true")
+
+        memory_attention_fullgraph = _env_bool(
+            "SAM2_COMPILE_MEMORY_ATTENTION_FULLGRAPH",
+            profile.get("compile_memory_attention_fullgraph", False),
+        )
+        memory_attention_dynamic = _env_bool(
+            "SAM2_COMPILE_MEMORY_ATTENTION_DYNAMIC",
+            profile.get("compile_memory_attention_dynamic", False),
+        )
+        memory_attention_mode = os.environ.get(
+            "SAM2_COMPILE_MEMORY_ATTENTION_MODE",
+            profile.get("compile_memory_attention_mode", "max-autotune-no-cudagraphs"),
+        )
+
+        hydra_overrides_extra.append(
+            "++model.compile_memory_attention_fullgraph="
+            f"{str(bool(memory_attention_fullgraph)).lower()}"
+        )
+        hydra_overrides_extra.append(
+            "++model.compile_memory_attention_dynamic="
+            f"{str(bool(memory_attention_dynamic)).lower()}"
+        )
+        hydra_overrides_extra.append(
+            f"++model.compile_memory_attention_mode={memory_attention_mode}"
+        )
+
     image_size = _env_int("SAM2_IMAGE_SIZE", profile["image_size"])
     if image_size is not None:
         hydra_overrides_extra.append(f"model.image_size={int(image_size)}")
