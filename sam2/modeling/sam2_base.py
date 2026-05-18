@@ -187,9 +187,19 @@ class SAM2Base(torch.nn.Module):
             print(
                 "Image encoder compilation is enabled. First forward pass will be slow."
             )
+            # Use max-autotune but disable CUDA Graphs. In the realtime camera
+            # tracker, the image encoder is called repeatedly while positional
+            # encodings are cached inside the model. With CUDA Graphs enabled,
+            # PyTorch can raise:
+            #
+            #   RuntimeError: accessing tensor output of CUDAGraphs that has been
+            #   overwritten by a subsequent run
+            #
+            # "max-autotune-no-cudagraphs" keeps the GEMM/convolution autotuning
+            # benefits while avoiding CUDA Graph lifetime issues in this fork.
             self.image_encoder.forward = torch.compile(
                 self.image_encoder.forward,
-                mode="max-autotune",
+                mode="max-autotune-no-cudagraphs",
                 fullgraph=True,
                 dynamic=False,
             )

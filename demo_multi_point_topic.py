@@ -212,7 +212,16 @@ from sam2.build_sam import build_sam2_camera_predictor
 
 sam2_checkpoint = "./checkpoints/sam2.1_hiera_small.pt"
 model_cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
-predictor = build_sam2_camera_predictor(model_cfg, sam2_checkpoint)
+
+# Enable PyTorch compilation for SAM2's image encoder.
+# This keeps the rest of the realtime camera tracker unchanged, while compiling
+# only the image backbone used on every incoming frame. The first frame after
+# model construction will be slower because torch.compile has to build the graph.
+predictor = build_sam2_camera_predictor(
+    model_cfg,
+    sam2_checkpoint,
+    hydra_overrides_extra=["++model.compile_image_encoder=true"],
+)
 
 HEADLESS = (os.environ.get("DISPLAY", "") == "")
 
