@@ -361,11 +361,13 @@ def _append_compile_overrides(
 def _build_hydra_overrides(profile):
     hydra_overrides_extra = []
 
-    if _env_bool(
-        "SAM2_COMPILE_IMAGE_ENCODER",
-        profile["compile_image_encoder"],
-    ):
-        hydra_overrides_extra.append("++model.compile_image_encoder=true")
+    _append_compile_overrides(
+        hydra_overrides_extra,
+        profile,
+        env_prefix="SAM2_COMPILE_IMAGE_ENCODER",
+        profile_key="compile_image_encoder",
+        model_key="compile_image_encoder",
+    )
 
     _append_compile_overrides(
         hydra_overrides_extra,

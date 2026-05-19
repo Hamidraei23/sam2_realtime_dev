@@ -11,6 +11,8 @@ useful for experiments without editing code:
     SAM2_IMAGE_SIZE=1024 python demo_multi_point_topic.py
     SAM2_NUM_MASKMEM=7 python demo_multi_point_topic.py
     SAM2_MEMORY_TEMPORAL_STRIDE=3 python demo_multi_point_topic.py
+    SAM2_COMPILE_IMAGE_ENCODER=0 python demo_multi_point_topic.py
+    SAM2_COMPILE_IMAGE_ENCODER_FULLGRAPH=0 python demo_multi_point_topic.py
     SAM2_COMPILE_MEMORY_ATTENTION=0 python demo_multi_point_topic.py
     SAM2_COMPILE_MEMORY_ATTENTION_FULLGRAPH=1 python demo_multi_point_topic.py
     SAM2_COMPILE_MEMORY_ATTENTION_DYNAMIC=1 python demo_multi_point_topic.py
@@ -34,10 +36,15 @@ SAM2_REALTIME_PROFILE = {
     "checkpoint": "./checkpoints/sam2.1_hiera_small.pt",
     "model_cfg": "configs/sam2.1/sam2.1_hiera_s.yaml",
 
-    # Keep the PyTorch-compiled image encoder enabled by default. In this fork,
-    # sam2/modeling/sam2_base.py compiles it with
-    # mode="max-autotune-no-cudagraphs" to avoid CUDA Graph lifetime issues.
+    # Keep the PyTorch-compiled image encoder enabled by default. It is handled
+    # by the same centralized compile block as the other optional compiled
+    # modules in sam2/modeling/sam2_base.py. The mode disables CUDA Graphs to
+    # avoid lifetime/reuse issues with cached positional encodings in the
+    # realtime camera loop.
     "compile_image_encoder": True,
+    "compile_image_encoder_fullgraph": True,
+    "compile_image_encoder_dynamic": False,
+    "compile_image_encoder_mode": "max-autotune-no-cudagraphs",
 
     # Compile the memory-attention module, which is the dominant bottleneck in
     # multi-object tracking. This is intentionally configurable because the first

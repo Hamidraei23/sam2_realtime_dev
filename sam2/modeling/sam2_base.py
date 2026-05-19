@@ -96,6 +96,9 @@ class SAM2Base(torch.nn.Module):
         # extra arguments used to construct the SAM mask decoder; if not None, it should be a dict of kwargs to be passed into `MaskDecoder` class.
         sam_mask_decoder_extra_args=None,
         compile_image_encoder: bool = False,
+        compile_image_encoder_mode: str = "max-autotune-no-cudagraphs",
+        compile_image_encoder_fullgraph: bool = True,
+        compile_image_encoder_dynamic: bool = False,
         compile_memory_attention: bool = False,
         compile_memory_attention_mode: str = "max-autotune-no-cudagraphs",
         compile_memory_attention_fullgraph: bool = False,
@@ -204,76 +207,76 @@ class SAM2Base(torch.nn.Module):
         self._perf_profile_sync_cuda = True
 
         # Model compilation
-        if compile_image_encoder:
-            # Compile the forward function (not the full module) to allow loading checkpoints.
-            print(
-                "Image encoder compilation is enabled. First forward pass will be slow."
-            )
-            # Use max-autotune but disable CUDA Graphs. CUDA Graphs can conflict
-            # with the cached positional encodings used by the image encoder in the
-            # realtime camera loop. This mode keeps autotuning while avoiding
-            # lifetime/reuse errors across consecutive frames.
-            self.image_encoder.forward = torch.compile(
-                self.image_encoder.forward,
-                mode="max-autotune-no-cudagraphs",
-                fullgraph=True,
-                dynamic=False,
-            )
+        #
+        # Keep every torch.compile target in one place so the runtime profile and
+        # Hydra overrides map cleanly to the modules that are compiled. We compile
+        # bound forward functions instead of whole modules to preserve checkpoint
+        # loading behavior and use the same fallback wrapper for all targets.
+        compile_targets = (
+            {
+                "enabled": compile_image_encoder,
+                "module": self.image_encoder,
+                "name": "image_encoder",
+                "mode": compile_image_encoder_mode,
+                "fullgraph": compile_image_encoder_fullgraph,
+                "dynamic": compile_image_encoder_dynamic,
+                "message": (
+                    "Image encoder compilation is enabled. First forward pass "
+                    "will be slow."
+                ),
+            },
+            {
+                "enabled": compile_memory_attention,
+                "module": self.memory_attention,
+                "name": "memory_attention",
+                "mode": compile_memory_attention_mode,
+                "fullgraph": compile_memory_attention_fullgraph,
+                "dynamic": compile_memory_attention_dynamic,
+                "message": (
+                    "Memory attention compilation is enabled. First tracking "
+                    "frames may be slow while TorchInductor compiles "
+                    "shape-specific graphs."
+                ),
+            },
+            {
+                "enabled": compile_memory_encoder,
+                "module": self.memory_encoder,
+                "name": "memory_encoder",
+                "mode": compile_memory_encoder_mode,
+                "fullgraph": compile_memory_encoder_fullgraph,
+                "dynamic": compile_memory_encoder_dynamic,
+                "message": (
+                    "Memory encoder compilation is enabled. First tracking "
+                    "frames may be slow while TorchInductor compiles "
+                    "shape-specific graphs."
+                ),
+            },
+            {
+                "enabled": compile_sam_mask_decoder,
+                "module": self.sam_mask_decoder,
+                "name": "sam_mask_decoder",
+                "mode": compile_sam_mask_decoder_mode,
+                "fullgraph": compile_sam_mask_decoder_fullgraph,
+                "dynamic": compile_sam_mask_decoder_dynamic,
+                "message": (
+                    "SAM mask decoder compilation is enabled. First tracking "
+                    "frames may be slow while TorchInductor compiles "
+                    "shape-specific graphs."
+                ),
+            },
+        )
 
-        if compile_memory_attention:
-            # Compile only the memory-attention forward path. This is the dominant
-            # bottleneck in multi-object realtime tracking, but its input shapes
-            # depend on the number of tracked objects and on the currently selected
-            # memory frames. With dynamic=False, TorchInductor will specialize and
-            # may compile a new graph when these shapes change. In this demo the
-            # object count is fixed after prompt selection, so the graph stabilizes
-            # after the initial warm-up frames.
-            print(
-                "Memory attention compilation is enabled. First tracking frames "
-                "may be slow while TorchInductor compiles shape-specific graphs."
-            )
-            self.memory_attention.forward = self._compile_forward_with_fallback(
-                self.memory_attention.forward,
-                name="memory_attention",
-                mode=compile_memory_attention_mode,
-                fullgraph=compile_memory_attention_fullgraph,
-                dynamic=compile_memory_attention_dynamic,
-            )
+        for target in compile_targets:
+            if not target["enabled"]:
+                continue
 
-        if compile_memory_encoder:
-            # Compile the memory encoder, which converts the current frame masks
-            # into memory features for future frames. Its input batch dimension
-            # scales with the number of tracked objects, so the compiled graph may
-            # specialize per object count. The fallback keeps the demo usable if
-            # TorchInductor cannot compile this module on a specific setup.
-            print(
-                "Memory encoder compilation is enabled. First tracking frames "
-                "may be slow while TorchInductor compiles shape-specific graphs."
-            )
-            self.memory_encoder.forward = self._compile_forward_with_fallback(
-                self.memory_encoder.forward,
-                name="memory_encoder",
-                mode=compile_memory_encoder_mode,
-                fullgraph=compile_memory_encoder_fullgraph,
-                dynamic=compile_memory_encoder_dynamic,
-            )
-
-        if compile_sam_mask_decoder:
-            # Compile the SAM mask decoder. This block is smaller than memory
-            # attention, but it scales with the number of tracked objects and is
-            # still measurable for 5+ objects. We keep fullgraph=False by default
-            # because the decoder has prompt/multimask branches and optional high
-            # resolution features.
-            print(
-                "SAM mask decoder compilation is enabled. First tracking frames "
-                "may be slow while TorchInductor compiles shape-specific graphs."
-            )
-            self.sam_mask_decoder.forward = self._compile_forward_with_fallback(
-                self.sam_mask_decoder.forward,
-                name="sam_mask_decoder",
-                mode=compile_sam_mask_decoder_mode,
-                fullgraph=compile_sam_mask_decoder_fullgraph,
-                dynamic=compile_sam_mask_decoder_dynamic,
+            print(target["message"])
+            target["module"].forward = self._compile_forward_with_fallback(
+                target["module"].forward,
+                name=target["name"],
+                mode=target["mode"],
+                fullgraph=target["fullgraph"],
+                dynamic=target["dynamic"],
             )
 
     @staticmethod
@@ -291,12 +294,20 @@ class SAM2Base(torch.nn.Module):
         flow. The fallback keeps the realtime demo usable: if compilation fails,
         the original eager implementation is used for the rest of the process.
         """
-        compiled_forward = torch.compile(
-            eager_forward,
-            mode=mode,
-            fullgraph=fullgraph,
-            dynamic=dynamic,
-        )
+        try:
+            compiled_forward = torch.compile(
+                eager_forward,
+                mode=mode,
+                fullgraph=fullgraph,
+                dynamic=dynamic,
+            )
+        except Exception as exc:
+            print(
+                f"[WARN] torch.compile setup for {name} failed; "
+                f"using eager mode. Error: {exc}"
+            )
+            return eager_forward
+
         state = {"failed": False}
 
         def wrapped_forward(*args, **kwargs):
