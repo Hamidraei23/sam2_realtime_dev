@@ -14,9 +14,12 @@ useful for experiments without editing code:
     SAM2_COMPILE_MEMORY_ATTENTION=0 python demo_multi_point_topic.py
     SAM2_COMPILE_MEMORY_ATTENTION_FULLGRAPH=1 python demo_multi_point_topic.py
     SAM2_COMPILE_MEMORY_ATTENTION_DYNAMIC=1 python demo_multi_point_topic.py
+    SAM2_COMPILE_MEMORY_ENCODER=0 python demo_multi_point_topic.py
+    SAM2_COMPILE_SAM_MASK_DECODER=0 python demo_multi_point_topic.py
 
 Important implementation detail:
-- `image_size`, `compile_image_encoder`, `compile_memory_attention`, and
+- `image_size`, `compile_image_encoder`, `compile_memory_attention`,
+  `compile_memory_encoder`, `compile_sam_mask_decoder`, and
   `memory_temporal_stride_for_eval` are applied as Hydra overrides before model
   construction.
 - `runtime_num_maskmem` is applied after checkpoint loading, because changing
@@ -48,6 +51,22 @@ SAM2_REALTIME_PROFILE = {
     "compile_memory_attention_fullgraph": False,
     "compile_memory_attention_dynamic": False,
     "compile_memory_attention_mode": "max-autotune-no-cudagraphs",
+
+    # Compile the memory encoder. This is a smaller block than memory attention,
+    # but it scales with the number of tracked objects. Set
+    # SAM2_COMPILE_MEMORY_ENCODER=0 to disable it.
+    "compile_memory_encoder": True,
+    "compile_memory_encoder_fullgraph": False,
+    "compile_memory_encoder_dynamic": False,
+    "compile_memory_encoder_mode": "max-autotune-no-cudagraphs",
+
+    # Compile the SAM mask decoder. This block is relatively small, so the gain
+    # may be modest, but it is measurable with several tracked objects. Set
+    # SAM2_COMPILE_SAM_MASK_DECODER=0 to disable it.
+    "compile_sam_mask_decoder": True,
+    "compile_sam_mask_decoder_fullgraph": False,
+    "compile_sam_mask_decoder_dynamic": False,
+    "compile_sam_mask_decoder_mode": "max-autotune-no-cudagraphs",
 
     # Internal SAM2 image resolution. 768 gave a strong speedup while preserving
     # more detail than more aggressive reductions such as 512.

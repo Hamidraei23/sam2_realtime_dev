@@ -100,6 +100,14 @@ class SAM2Base(torch.nn.Module):
         compile_memory_attention_mode: str = "max-autotune-no-cudagraphs",
         compile_memory_attention_fullgraph: bool = False,
         compile_memory_attention_dynamic: bool = False,
+        compile_memory_encoder: bool = False,
+        compile_memory_encoder_mode: str = "max-autotune-no-cudagraphs",
+        compile_memory_encoder_fullgraph: bool = False,
+        compile_memory_encoder_dynamic: bool = False,
+        compile_sam_mask_decoder: bool = False,
+        compile_sam_mask_decoder_mode: str = "max-autotune-no-cudagraphs",
+        compile_sam_mask_decoder_fullgraph: bool = False,
+        compile_sam_mask_decoder_dynamic: bool = False,
     ):
         super().__init__()
 
@@ -230,6 +238,42 @@ class SAM2Base(torch.nn.Module):
                 mode=compile_memory_attention_mode,
                 fullgraph=compile_memory_attention_fullgraph,
                 dynamic=compile_memory_attention_dynamic,
+            )
+
+        if compile_memory_encoder:
+            # Compile the memory encoder, which converts the current frame masks
+            # into memory features for future frames. Its input batch dimension
+            # scales with the number of tracked objects, so the compiled graph may
+            # specialize per object count. The fallback keeps the demo usable if
+            # TorchInductor cannot compile this module on a specific setup.
+            print(
+                "Memory encoder compilation is enabled. First tracking frames "
+                "may be slow while TorchInductor compiles shape-specific graphs."
+            )
+            self.memory_encoder.forward = self._compile_forward_with_fallback(
+                self.memory_encoder.forward,
+                name="memory_encoder",
+                mode=compile_memory_encoder_mode,
+                fullgraph=compile_memory_encoder_fullgraph,
+                dynamic=compile_memory_encoder_dynamic,
+            )
+
+        if compile_sam_mask_decoder:
+            # Compile the SAM mask decoder. This block is smaller than memory
+            # attention, but it scales with the number of tracked objects and is
+            # still measurable for 5+ objects. We keep fullgraph=False by default
+            # because the decoder has prompt/multimask branches and optional high
+            # resolution features.
+            print(
+                "SAM mask decoder compilation is enabled. First tracking frames "
+                "may be slow while TorchInductor compiles shape-specific graphs."
+            )
+            self.sam_mask_decoder.forward = self._compile_forward_with_fallback(
+                self.sam_mask_decoder.forward,
+                name="sam_mask_decoder",
+                mode=compile_sam_mask_decoder_mode,
+                fullgraph=compile_sam_mask_decoder_fullgraph,
+                dynamic=compile_sam_mask_decoder_dynamic,
             )
 
     @staticmethod
