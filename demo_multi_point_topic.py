@@ -13,10 +13,30 @@ from rclpy.qos import QoSProfile, qos_profile_sensor_data
 from geometry_msgs.msg import Pose, PoseArray, PointStamped
 from sensor_msgs.msg import Image
 
+from sam2_realtime_config import SAM2_REALTIME_PROFILE
 
-PROFILE_TIMERS = os.environ.get("SAM2_PROFILE_TIMERS", "1") != "0"
-PROFILE_SYNC_CUDA = os.environ.get("SAM2_PROFILE_SYNC_CUDA", "1") != "0"
-PROFILE_PRINT_EVERY = int(os.environ.get("SAM2_PROFILE_PRINT_EVERY", "60"))
+
+def _profile_env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return bool(default)
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
+PROFILE_TIMERS = _profile_env_bool(
+    "SAM2_PROFILE_TIMERS",
+    SAM2_REALTIME_PROFILE.get("profile_timers", False),
+)
+PROFILE_SYNC_CUDA = _profile_env_bool(
+    "SAM2_PROFILE_SYNC_CUDA",
+    SAM2_REALTIME_PROFILE.get("profile_sync_cuda", True),
+)
+PROFILE_PRINT_EVERY = int(
+    os.environ.get(
+        "SAM2_PROFILE_PRINT_EVERY",
+        SAM2_REALTIME_PROFILE.get("profile_print_every", 60),
+    )
+)
 
 def _profile_sync_cuda():
     if PROFILE_SYNC_CUDA and torch.cuda.is_available():
@@ -301,7 +321,6 @@ if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
     torch.backends.cudnn.allow_tf32 = True
 
 from sam2.build_sam import build_sam2_camera_predictor
-from sam2_realtime_config import SAM2_REALTIME_PROFILE
 
 
 def _env_bool(name: str, default: bool) -> bool:

@@ -16,6 +16,7 @@ useful for experiments without editing code:
     SAM2_COMPILE_MEMORY_ATTENTION=0 python demo_multi_point_topic.py
     SAM2_COMPILE_MEMORY_ATTENTION_FULLGRAPH=1 python demo_multi_point_topic.py
     SAM2_COMPILE_MEMORY_ATTENTION_DYNAMIC=1 python demo_multi_point_topic.py
+    SAM2_PROFILE_TIMERS=1 python demo_multi_point_topic.py
     SAM2_COMPILE_MEMORY_ENCODER=0 python demo_multi_point_topic.py
     SAM2_COMPILE_SAM_MASK_DECODER=0 python demo_multi_point_topic.py
 
@@ -31,6 +32,13 @@ Important implementation detail:
 
 SAM2_REALTIME_PROFILE = {
     "name": "sam2.1-small-realtime-768-maskmem5-stride2",
+
+    # Demo/profiling defaults. Timers are disabled by default for normal runs
+    # because they add synchronization/formatting overhead and produce verbose
+    # output. Enable them only for profiling with SAM2_PROFILE_TIMERS=1.
+    "profile_timers": False,
+    "profile_sync_cuda": True,
+    "profile_print_every": 60,
 
     # Model selection
     "checkpoint": "./checkpoints/sam2.1_hiera_small.pt",
