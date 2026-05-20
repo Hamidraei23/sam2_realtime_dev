@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 import torch
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager
 
 import rclpy
@@ -41,6 +41,36 @@ PROFILE_PRINT_EVERY = int(
 def _profile_sync_cuda():
     if PROFILE_SYNC_CUDA and torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+def draw_fps_overlay(image_rgb, fps_value):
+    """Draw a compact FPS indicator in the top-right corner of an RGB image."""
+    if fps_value is None or fps_value <= 0.0:
+        text = "FPS: --"
+    else:
+        text = f"FPS: {fps_value:.1f}"
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 2.0
+    thickness = 3
+    margin = 1
+    pad_x = 4
+    pad_y = 4
+
+    text_size, baseline = cv2.getTextSize(text, font, scale, thickness)
+    text_w, text_h = text_size
+    h, w = image_rgb.shape[:2]
+    x = max(margin, w - text_w - margin - 2 * pad_x)
+    y = margin + text_h + pad_y
+
+    x0 = max(0, x - pad_x)
+    y0 = max(0, y - text_h - pad_y)
+    x1 = min(w - 1, x + text_w + pad_x)
+    y1 = min(h - 1, y + baseline + pad_y)
+
+    # RGB image: black background, white text.
+    cv2.rectangle(image_rgb, (x0, y0), (x1, y1), (0, 0, 0), -1)
+    cv2.putText(image_rgb, text, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
 @contextmanager
 def profile_section(profile, key):
@@ -647,6 +677,9 @@ def main():
 
     t0 = time.time()
     n = 0
+    fps_window = deque(maxlen=3)
+    last_processed_frame_time = None
+    display_fps = 0.0
     profile_acc = RollingProfiler()
     video_writer = None
     is_recording = False
@@ -672,6 +705,14 @@ def main():
             frame_bgr = ros_node.pop_latest_frame()
         if frame_bgr is None:
             continue
+
+        now_frame_time = time.perf_counter()
+        if last_processed_frame_time is not None:
+            dt_frame = now_frame_time - last_processed_frame_time
+            if dt_frame > 0.0:
+                fps_window.append(1.0 / dt_frame)
+                display_fps = sum(fps_window) / len(fps_window)
+        last_processed_frame_time = now_frame_time
 
         frame_rgb = frame_bgr  # _imgmsg_to_rgb8 already returns RGB
         with profile_section(frame_profile, "predictor_wall_ms"):
@@ -785,6 +826,8 @@ def main():
             # Draw external poses from /tracked_objects_a (orange circles, RGB space)
             # for ext_cx, ext_cy in ros_node._ext_poses:
             #     cv2.circle(vis_rgb, (int(ext_cx), int(ext_cy)), 10, (255, 140, 0), 2)
+
+            draw_fps_overlay(vis_rgb, display_fps)
 
             vis_bgr = cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR)
 
