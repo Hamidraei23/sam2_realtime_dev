@@ -38,6 +38,20 @@ PROFILE_PRINT_EVERY = int(
     )
 )
 
+SHOW_FPS_OVERLAY = _profile_env_bool(
+    "SAM2_SHOW_FPS_OVERLAY",
+    SAM2_REALTIME_PROFILE.get("show_fps_overlay", False),
+)
+FPS_OVERLAY_WINDOW = max(
+    1,
+    int(
+        os.environ.get(
+            "SAM2_FPS_OVERLAY_WINDOW",
+            SAM2_REALTIME_PROFILE.get("fps_overlay_window", 3),
+        )
+    ),
+)
+
 def _profile_sync_cuda():
     if PROFILE_SYNC_CUDA and torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -677,7 +691,7 @@ def main():
 
     t0 = time.time()
     n = 0
-    fps_window = deque(maxlen=3)
+    fps_window = deque(maxlen=FPS_OVERLAY_WINDOW)
     last_processed_frame_time = None
     display_fps = 0.0
     profile_acc = RollingProfiler()
@@ -706,13 +720,14 @@ def main():
         if frame_bgr is None:
             continue
 
-        now_frame_time = time.perf_counter()
-        if last_processed_frame_time is not None:
-            dt_frame = now_frame_time - last_processed_frame_time
-            if dt_frame > 0.0:
-                fps_window.append(1.0 / dt_frame)
-                display_fps = sum(fps_window) / len(fps_window)
-        last_processed_frame_time = now_frame_time
+        if SHOW_FPS_OVERLAY:
+            now_frame_time = time.perf_counter()
+            if last_processed_frame_time is not None:
+                dt_frame = now_frame_time - last_processed_frame_time
+                if dt_frame > 0.0:
+                    fps_window.append(1.0 / dt_frame)
+                    display_fps = sum(fps_window) / len(fps_window)
+            last_processed_frame_time = now_frame_time
 
         frame_rgb = frame_bgr  # _imgmsg_to_rgb8 already returns RGB
         with profile_section(frame_profile, "predictor_wall_ms"):
@@ -827,7 +842,8 @@ def main():
             # for ext_cx, ext_cy in ros_node._ext_poses:
             #     cv2.circle(vis_rgb, (int(ext_cx), int(ext_cy)), 10, (255, 140, 0), 2)
 
-            draw_fps_overlay(vis_rgb, display_fps)
+            if SHOW_FPS_OVERLAY:
+                draw_fps_overlay(vis_rgb, display_fps)
 
             vis_bgr = cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR)
 

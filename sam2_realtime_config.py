@@ -17,6 +17,8 @@ useful for experiments without editing code:
     SAM2_COMPILE_MEMORY_ATTENTION_FULLGRAPH=1 python demo_multi_point_topic.py
     SAM2_COMPILE_MEMORY_ATTENTION_DYNAMIC=1 python demo_multi_point_topic.py
     SAM2_PROFILE_TIMERS=1 python demo_multi_point_topic.py
+    SAM2_SHOW_FPS_OVERLAY=1 python demo_multi_point_topic.py
+    SAM2_FPS_OVERLAY_WINDOW=5 python demo_multi_point_topic.py
     SAM2_COMPILE_MEMORY_ENCODER=0 python demo_multi_point_topic.py
     SAM2_COMPILE_SAM_MASK_DECODER=0 python demo_multi_point_topic.py
 
@@ -39,6 +41,13 @@ SAM2_REALTIME_PROFILE = {
     "profile_timers": False,
     "profile_sync_cuda": True,
     "profile_print_every": 60,
+
+    # Optional visual FPS marker drawn in the top-right corner of the displayed
+    # segmentation image. Disabled by default to keep the visualization clean.
+    # Enable it with SAM2_SHOW_FPS_OVERLAY=1. The value shown is the rolling
+    # average over the last `fps_overlay_window` processed frames.
+    "show_fps_overlay": False,
+    "fps_overlay_window": 3,
 
     # Model selection
     "checkpoint": "./checkpoints/sam2.1_hiera_small.pt",
