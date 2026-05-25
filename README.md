@@ -5,6 +5,8 @@
 This project can be built and run using Docker.
 Which includes SAM realtime + selection of oject of interest + ros2 
 
+Note: The following installation steps are designed for Ubuntu 22.04 and ROS 2 Humble. If you are using Ubuntu 24.04 and ROS2 Jazzy, you can use the Dockerfile.sam2_jazzy file instead.
+
 ### Prerequisites
 - Docker installed and running
 - Git installed
@@ -18,6 +20,12 @@ git clone git@github.com:Hamidraei23/sam2_realtime_dev.git
 cd sam2_realtime_dev
 docker build -t sam2-backend:latest .
 ```
+
+Note: use this command if you are using Ubuntu 24.04 and ROS2 Jazzy:
+```bash
+docker build -f Dockerfile.sam2_jazzy -t sam2-backend:jazzy .
+```
+
 ### 2) Build the image
 ```bash
 docker build -t sam2-backend:latest .
