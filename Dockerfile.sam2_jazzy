@@ -1,0 +1,50 @@
+FROM osrf/ros:jazzy-desktop
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+ENV SAM2_BUILD_CUDA=0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-pip \
+    python3-venv \
+    python3-dev \
+    git \
+    build-essential \
+    ninja-build \
+    ffmpeg \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libgomp1 \
+    ros-jazzy-rosbag2 \
+    ros-jazzy-rosbag2-transport \
+    ros-jazzy-rosbag2-storage-mcap \
+    ros-jazzy-rosbag2-storage-default-plugins \
+    ros-jazzy-rqt-image-view \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv --system-site-packages /opt/venv
+
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+RUN pip install --no-cache-dir \
+    torch==2.5.1 \
+    torchvision==0.20.1 \
+    torchaudio==2.5.1 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+WORKDIR /opt/sam2/src
+
+COPY . /opt/sam2/src
+
+RUN pip install --no-cache-dir -e ".[interactive-demo]"
+
+RUN pip install --no-cache-dir opencv-python==4.13.0.90
+
+RUN echo "source /opt/ros/jazzy/setup.bash" >> /etc/bash.bashrc && \
+    echo "source /opt/venv/bin/activate" >> /etc/bash.bashrc
+
+WORKDIR /workspace
